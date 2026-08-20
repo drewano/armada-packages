@@ -547,3 +547,13 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `dts/sm8650-konkr-pf.dts.patch`
   source: armada
   notes: Armada selects the shared WSA2 channel mapping through a Pocket FIT-specific sound-card compatible.
+
+- `patches/0520-usb-dwc3-qcom-skip-phy-management-by-usb-core.patch`
+  source: https://lore.kernel.org/all/20260723-dwc3-skip-init-quirk-v1-1-97682bb44ebd@oss.qualcomm.com/
+  upstream: https://lore.kernel.org/all/20260723-dwc3-skip-init-quirk-v1-1-97682bb44ebd@oss.qualcomm.com/
+  notes: FROMLIST backport from qualcomm-linux/kernel-topics `tech/bus/usb/dwc` (Krishna Kurapati, Acked-by Thinh Nguyen). Fixes armada#274 symptom 3: HCD core holds extra `phy_init`, so `phy_exit()` never fires in host-mode suspend and CX never collapses — Odin 2 right-side heat in s2idle (#265). Carried verbatim.
+
+- `patches/0521-mmc-sdhci-msm-force-runtime-suspend-before-s2idle.patch`
+  source: armada
+  upstream: local
+  notes: Armada-authored lightweight alternative to Pocknix 0210's 6200-line downstream sdhci-msm driver. Fixes armada#274 symptom 2 (mmc0 ~30 irq/s during s2idle while runtime_status=suspended): adds a `prepare` callback that forces runtime suspend before the system suspend path, when the autosuspend timer would otherwise race s2idle entry. Safe for SD rootfs — in-flight I/O holds the PM usage counter and the call returns -EBUSY. Complements 0520 (CX vote) — together they address both RPMh vote holders blocking AOSD/CXSD on SM8550.
