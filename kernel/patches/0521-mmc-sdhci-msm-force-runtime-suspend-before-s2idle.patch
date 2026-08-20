@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: drewano <drewano@users.noreply.github.com>
+Date: Thu, 20 Aug 2026 00:00:00 +0000
+Subject: [PATCH] mmc: sdhci-msm: force runtime suspend before s2idle
+
+Upstream sdhci_msm_runtime_suspend gates clocks immediately and relies on
+pm_runtime autosuspend (200ms) to quiesce the SD slot. During s2idle
+entry the autosuspend timer can race the system suspend path: the PM core
+polls RPMh for AOSD/CXSD while the SD controller is still technically
+runtime-active, and spurious SD IRQs (~30/s on Odin 2, armada#274)
+repeatedly reset the timer so the controller never actually suspends.
+
+Pocknix addresses this by carrying the full Qualcomm downstream
+sdhci-msm driver (0210, ~6200 lines) which defers clock gating to a
+delayed_work and flushes it synchronously in suspend_late(). Rather than
+import the downstream driver, take the minimal PM-relevant idea: ensure
+the SD controller is runtime-suspended before the system suspend path
+proceeds.
+
+This patch adds a suspend prepare callback that forces the controller
+into runtime suspend if it is still active. Prepare runs after the
+thermal core quiesces zones and before suspend callbacks, so autosuspend
+state is stable. pm_runtime_suspend() respects the usage counter —
+an SD rootfs with in-flight I/O leaves the controller active and returns
+-EBUSY, which we treat as non-fatal (safe). Resume is via the existing
+pm_runtime_force_resume in SYSTEM_SLEEP_PM_OPS.
+
+References: armada#274 (mmc0 IRQ storm, 30 irq/s while
+runtime_status=suspended), Pocknix 0210 analysis by hugare, follow-up
+0212 (SDCC RCG floor ops revert). Already have 0204 tsens prepare — same
+phase ordering.
+
+Complements the dwc3 qcom PHY fix (0520) — together they address both
+RPMh vote holders on SM8550 that block CX/AO collapse.
+---
+ drivers/mmc/host/sdhci-msm.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/drivers/mmc/host/sdhci-msm.c b/drivers/mmc/host/sdhci-msm.c
+index 0000000..0000000 100644
+--- a/drivers/mmc/host/sdhci-msm.c
++++ b/drivers/mmc/host/sdhci-msm.c
+@@ -2934,6 +2934,36 @@ static int sdhci_msm_runtime_resume(struct device *dev)
+ 	return ret;
+ }
+ 
++static int __maybe_unused sdhci_msm_prepare(struct device *dev)
++{
++	/*
++	 * s2idle thermal: armada#274 shows mmc0 firing ~30 irq/s during
++	 * s2idle while reporting runtime_status=suspended. The autosuspend
++	 * timer can race system suspend and spurious IRQs reset it, so
++	 * the controller never truly gates. Prepare runs after the thermal
++	 * core quiesces zones and before suspend callbacks — force runtime
++	 * suspend if still active. Safe for SD rootfs: in-flight I/O holds
++	 * the PM usage counter and pm_runtime_suspend() returns -EBUSY.
++	 */
++	if (!pm_runtime_status_suspended(dev)) {
++		int ret = pm_runtime_suspend(dev);
++
++		if (ret == -EBUSY || ret == -EAGAIN) {
++			dev_dbg(dev, "prepare: controller busy, deferring suspend (%d)\n", ret);
++			return 0;
++		}
++		if (ret && ret != 1) {
++			/* 1 means already suspending; only warn on real errors */
++			dev_warn(dev, "prepare: runtime suspend failed %d\n", ret);
++		} else if (!ret || ret == 1) {
++			dev_dbg(dev, "prepare: forced runtime suspend before s2idle\n");
++		}
++	}
++	return 0;
++}
++
+ static const struct dev_pm_ops sdhci_msm_pm_ops = {
++	.prepare = sdhci_msm_prepare,
+ 	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+ 	RUNTIME_PM_OPS(sdhci_msm_runtime_suspend, sdhci_msm_runtime_resume, NULL)
+ };
