@@ -547,3 +547,8 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `dts/sm8650-konkr-pf.dts.patch`
   source: armada
   notes: Armada selects the shared WSA2 channel mapping through a Pocket FIT-specific sound-card compatible.
+
+- `patches/0520-usb-dwc3-qcom-skip-phy-management-by-usb-core.patch`
+  source: https://lore.kernel.org/all/20260723-dwc3-skip-init-quirk-v1-1-97682bb44ebd@oss.qualcomm.com/
+  upstream: https://lore.kernel.org/all/20260723-dwc3-skip-init-quirk-v1-1-97682bb44ebd@oss.qualcomm.com/
+  notes: FROMLIST backport from qualcomm-linux/kernel-topics `tech/bus/usb/dwc` (Krishna Kurapati, Acked-by Thinh Nguyen). Fixes armada#274 symptom 3: HCD core holds extra `phy_init`, so `phy_exit()` never fires in host-mode suspend and CX never collapses — Odin 2 right-side heat in s2idle (#265). Carried verbatim.
