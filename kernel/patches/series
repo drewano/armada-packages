@@ -94,6 +94,7 @@ v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 # early-return path) + dwc3 PHY holds CX vote (lore 20260723).
 0521-mmc-sdhci-msm-mask-controller-irqs-while-runtime-suspended.patch
 0522-usb-dwc3-qcom-skip-phy-management-by-usb-core.patch
+0530-hwmon-pwm-fan-quiesce-tach-irqs-and-rpm-timer-across-suspend.patch
 
 # ============== SM8550 DTSI prerequisites ==============
 0001-pcie-update-sm8550-dtsi.patch
