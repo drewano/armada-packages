@@ -20,10 +20,12 @@ them on resume before restoring the PWM. timer_setup() runs
 unconditionally in probe(), so timer_delete_sync() is safe even on
 boards without tach inputs, and irqs are only touched when actually
 requested (tach->irq > 0), mirroring probe().
-
+---
+diff --git a/drivers/hwmon/pwm-fan.c b/drivers/hwmon/pwm-fan.c
+index 37f3781..2ea7395 100644
 --- a/drivers/hwmon/pwm-fan.c
 +++ b/drivers/hwmon/pwm-fan.c
-@@ -709,15 +709,33 @@ static void pwm_fan_shutdown(struct platform_device *pdev)
+@@ -710,6 +710,14 @@ static void pwm_fan_shutdown(struct platform_device *pdev)
  static int pwm_fan_suspend(struct device *dev)
  {
  	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
@@ -38,7 +40,7 @@ requested (tach->irq > 0), mirroring probe().
  
  	return pwm_fan_power_off(ctx, true);
  }
- 
+@@ -717,6 +725,19 @@ static int pwm_fan_suspend(struct device *dev)
  static int pwm_fan_resume(struct device *dev)
  {
  	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
@@ -58,44 +60,3 @@ requested (tach->irq > 0), mirroring probe().
  
  	return set_pwm(ctx, ctx->pwm_value);
  }
--- 
-2.49.0
-
---- a/drivers/hwmon/pwm-fan.c
-+++ b/drivers/hwmon/pwm-fan.c
-@@ -710,6 +710,14 @@
- static int pwm_fan_suspend(struct device *dev)
- {
- 	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
-+	int i;
-+
-+	timer_delete_sync(&ctx->rpm_timer);
-+
-+	for (i = 0; i < ctx->tach_count; i++) {
-+		if (ctx->tachs[i].irq > 0)
-+			disable_irq(ctx->tachs[i].irq);
-+	}
- 
- 	return pwm_fan_power_off(ctx, true);
- }
-@@ -717,7 +725,20 @@
- static int pwm_fan_resume(struct device *dev)
- {
- 	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
-+	int i;
- 
-+	for (i = 0; i < ctx->tach_count; i++) {
-+		if (ctx->tachs[i].irq > 0) {
-+			atomic_set(&ctx->tachs[i].pulses, 0);
-+			enable_irq(ctx->tachs[i].irq);
-+		}
-+	}
-+
-+	if (ctx->tach_count > 0) {
-+		ctx->sample_start = ktime_get();
-+		mod_timer(&ctx->rpm_timer, jiffies + HZ);
-+	}
-+
- 	return set_pwm(ctx, ctx->pwm_value);
- }
- 
