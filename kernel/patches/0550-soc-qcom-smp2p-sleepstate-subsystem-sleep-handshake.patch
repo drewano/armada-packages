@@ -79,10 +79,10 @@ index 798643b..766e08e 100644
  obj-$(CONFIG_QCOM_SPM)		+= spm.o
 diff --git a/drivers/soc/qcom/smp2p-sleepstate.c b/drivers/soc/qcom/smp2p-sleepstate.c
 new file mode 100644
-index 0000000..c3c6cbc
+index 0000000..9645aae
 --- /dev/null
 +++ b/drivers/soc/qcom/smp2p-sleepstate.c
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,129 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
