@@ -95,6 +95,10 @@ v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 0521-mmc-sdhci-msm-mask-controller-irqs-while-runtime-suspended.patch
 0522-usb-dwc3-qcom-skip-phy-management-by-usb-core.patch
 0530-hwmon-pwm-fan-quiesce-tach-irqs-and-rpm-timer-across-suspend.patch
+# EXPERIMENTAL (armada#274): port vendor smp2p sleep-state handshake —
+# the AP must tell the ADSP it is sleeping or AOP keeps the system at
+# awake-level power in suspend (measured 475 mA "deep" on Odin 2).
+0550-soc-qcom-smp2p-sleepstate-subsystem-sleep-handshake.patch
 
 # ============== SM8550 DTSI prerequisites ==============
 0001-pcie-update-sm8550-dtsi.patch
