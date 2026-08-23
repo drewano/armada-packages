@@ -100,6 +100,7 @@ v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 # (arch_timer encore actif à 43/s pendant le "deep"). ROCKNIX PR #2954 a
 # mesuré ~50 mA / 0.6 %/h sur Odin 2 avec ce stack ; source :
 # shuuri-labs/pocknix-os kernel/sm8550/patches/20-sm8550.
+0550-soc-qcom-smp2p-sleepstate-subsystem-sleep-handshake.patch
 0560-regulator-qcom-rpmh-add-suspend-state-support.patch
 0561-regulator-core-apply-mem-state-for-s2idle.patch
 0564-tty-serial-qcom-geni-mask-non-console-irq-on-suspend.patch
