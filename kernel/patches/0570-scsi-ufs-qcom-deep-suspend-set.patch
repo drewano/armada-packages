@@ -1,12 +1,12 @@
 From: Armada <noreply@armada.local>
-Subject: [PATCH] scsi: ufs: qcom: deep-suspend set (Pocknix 0201/1007/1008/1015 folded)
+Subject: [PATCH] scsi: ufs: qcom: deep-suspend set (fold auto-contenu v7.2)
 
-Folded UFS suspend set from the Pocknix/ROCKNIX deep-suspend stack
-(jaewun), rebased onto v7.2 on top of our 0511: drain relink completions
-out-of-band PM, hibern8-exit clk-scale propagation, auto-hibern8
-collision, mphy park, rx-linecfg disable + shared phy header. Deep
-suspend uses LINK_OFF on this platform; one UFS host reset per resume is
-expected.
+Fold UFS auto-contenu contre le v7.2 pristine : rebase des fixes
+Pocknix/ROCKNIX (drain relink OOB PM, hibern8-exit clk-scale,
+auto-hibern8 collision, mphy park, rx-linecfg + header phy partagé,
+duplicate POST_CHANGE fusionné) PLUS notre 0511 (re-enable IRQ sur
+échec de host reset) qui est retiré du series au profit de ce fold.
+Deep suspend utilise LINK_OFF sur cette plateforme.
 
 diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c b/drivers/phy/qualcomm/phy-qcom-qmp-ufs.c
 index 0f4ad24..6aad4d9 100644
@@ -95,7 +95,7 @@ index 0f4ad24..6aad4d9 100644
  {
  	struct qmp_ufs *qmp = phy_get_drvdata(phy);
 diff --git a/drivers/ufs/host/ufs-qcom.c b/drivers/ufs/host/ufs-qcom.c
-index e64e1f9..528404b 100644
+index 291c434..9166fa7 100644
 --- a/drivers/ufs/host/ufs-qcom.c
 +++ b/drivers/ufs/host/ufs-qcom.c
 @@ -13,6 +13,7 @@
@@ -106,7 +106,36 @@ index e64e1f9..528404b 100644
  #include <linux/platform_device.h>
  #include <linux/pm_domain.h>
  #include <linux/reset-controller.h>
-@@ -717,10 +718,17 @@ static void ufs_qcom_link_startup_post_change(struct ufs_hba *hba)
+@@ -449,7 +450,7 @@ static int ufs_qcom_host_reset(struct ufs_hba *hba)
+ 	if (ret) {
+ 		dev_err(hba->dev, "%s: core_reset assert failed, err = %d\n",
+ 				 __func__, ret);
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	/*
+@@ -463,15 +464,17 @@ static int ufs_qcom_host_reset(struct ufs_hba *hba)
+ 	if (ret) {
+ 		dev_err(hba->dev, "%s: core_reset deassert failed, err = %d\n",
+ 				 __func__, ret);
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	usleep_range(1000, 1100);
+ 
++	ret = 0;
++out:
+ 	if (reenable_intr)
+ 		ufshcd_enable_irq(hba);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static u32 ufs_qcom_get_hs_gear(struct ufs_hba *hba)
+@@ -715,10 +718,17 @@ static void ufs_qcom_link_startup_post_change(struct ufs_hba *hba)
  static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
  					enum ufs_notify_change_status status)
  {
@@ -124,20 +153,18 @@ index e64e1f9..528404b 100644
  		if (ufs_qcom_cfg_timers(hba, false, ULONG_MAX)) {
  			dev_err(hba->dev, "%s: ufs_qcom_cfg_timers() failed\n",
  				__func__);
-@@ -740,6 +748,12 @@ static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
- 		err = ufshcd_disable_host_tx_lcc(hba);
+@@ -739,6 +749,10 @@ static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
  
  		break;
-+	case POST_CHANGE:
+ 	case POST_CHANGE:
 +		linecfg_err = qcom_qmp_ufs_ctrl_rx_linecfg(host->generic_phy, false);
 +		if (linecfg_err && linecfg_err != -EOPNOTSUPP)
 +			dev_warn(hba->dev, "failed to disable RX LineCfg: %d\n",
 +				 linecfg_err);
-+		break;
- 	case POST_CHANGE:
  		ufs_qcom_link_startup_post_change(hba);
  		break;
-@@ -1322,6 +1336,18 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
+ 	default:
+@@ -1320,6 +1334,18 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
  
  	if (drvdata && drvdata->quirks)
  		hba->quirks |= drvdata->quirks;
@@ -156,7 +183,7 @@ index e64e1f9..528404b 100644
  }
  
  static void ufs_qcom_set_phy_gear(struct ufs_qcom_host *host)
-@@ -1949,10 +1975,10 @@ static int ufs_qcom_clk_scale_notify(struct ufs_hba *hba, bool scale_up,
+@@ -1947,10 +1973,10 @@ static int ufs_qcom_clk_scale_notify(struct ufs_hba *hba, bool scale_up,
  		}
  
  		ufs_qcom_icc_update_bw(host);
@@ -169,29 +196,3 @@ index e64e1f9..528404b 100644
  }
  
  static void ufs_qcom_enable_test_bus(struct ufs_qcom_host *host)
-diff --git a/include/linux/phy/phy-qcom-qmp-ufs.h b/include/linux/phy/phy-qcom-qmp-ufs.h
-new file mode 100644
-index 0000000..b756300
---- /dev/null
-+++ b/include/linux/phy/phy-qcom-qmp-ufs.h
-@@ -0,0 +1,20 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+#ifndef __PHY_QCOM_QMP_UFS_H__
-+#define __PHY_QCOM_QMP_UFS_H__
-+
-+#include <linux/errno.h>
-+#include <linux/kconfig.h>
-+#include <linux/types.h>
-+
-+struct phy;
-+
-+#if IS_ENABLED(CONFIG_PHY_QCOM_QMP_UFS)
-+int qcom_qmp_ufs_ctrl_rx_linecfg(struct phy *phy, bool enable);
-+#else
-+static inline int qcom_qmp_ufs_ctrl_rx_linecfg(struct phy *phy, bool enable)
-+{
-+	return -EOPNOTSUPP;
-+}
-+#endif
-+
-+#endif

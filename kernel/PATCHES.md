@@ -239,7 +239,7 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
 - `patches/0510-soc-qcom-ice-unwind-clocks-on-resume-failure.patch`
   source: armada
   upstream: local
-- `patches/0511-scsi-ufs-qcom-reenable-irq-on-host-reset-failure.patch`
+- ~~`patches/0511-scsi-ufs-qcom-reenable-irq-on-host-reset-failure.patch`~~ (absorbé par le fold 0570, retiré du series)
   source: armada
   upstream: local
 - `patches/0512-PCI-qcom-skip-L23-ready-poll-on-SM8550.patch`
