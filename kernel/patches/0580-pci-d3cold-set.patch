@@ -1,0 +1,5837 @@
+From: Armada <noreply@armada.local>
+Subject: [PATCH] PCI: qcom: d3cold support set (Pocknix 1040-1044 folded)
+
+Backport of the PCIe d3cold powerdown stack from the Pocknix/ROCKNIX
+deep-suspend set (jaewun), rebased onto v7.2 on top of our skip-L23
+(0512) and suspend-OPP (0513) patches: host-common d3cold eligibility
+helper, qcom get_ltssm via PARF_LTSSM, PHY powerdown via PARF_PHY_CTRL,
+dwc core eligibility use, and qcom d3cold support. Lets both root ports
+reach d3cold during system suspend.
+
+diff --git a/drivers/pci/controller/dwc/pcie-designware-host.c b/drivers/pci/controller/dwc/pcie-designware-host.c
+index 0672225..71c99cb 100644
+--- a/drivers/pci/controller/dwc/pcie-designware-host.c
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c
+@@ -16,11 +16,9 @@
+ #include <linux/msi.h>
+ #include <linux/of_address.h>
+ #include <linux/of_pci.h>
+-#include <linux/pci.h>
+ #include <linux/pci_regs.h>
+ #include <linux/platform_device.h>
+ 
+-#include "../pci-host-common.h"
+ #include "../../pci.h"
+ #include "pcie-designware.h"
+ 
+@@ -1222,14 +1220,18 @@ static int dw_pcie_pme_turn_off(struct dw_pcie *pci)
+ 
+ int dw_pcie_suspend_noirq(struct dw_pcie *pci)
+ {
+-	bool pme_capable = false;
++	u8 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
+ 	int ret = 0;
+ 	u32 val;
+ 
+ 	if (!dw_pcie_link_up(pci))
+ 		goto stop_link;
+ 
+-	if (!pci_host_common_d3cold_possible(pci->pp.bridge, &pme_capable))
++	/*
++	 * If L1SS is supported, then do not put the link into L2 as some
++	 * devices such as NVMe expect low resume latency.
++	 */
++	if (dw_pcie_readw_dbi(pci, offset + PCI_EXP_LNKCTL) & PCI_EXP_LNKCTL_ASPM_L1)
+ 		return 0;
+ 
+ 	if (pci->pp.ops->pme_turn_off) {
+@@ -1281,7 +1283,6 @@ stop_link:
+ 	 * power off only if device supports PME from D3cold and Vaux is
+ 	 * not supported.
+ 	 */
+-	pci->pp.skip_pwrctrl_off = pme_capable;
+ 	dw_pcie_stop_link(pci);
+ 	if (pci->pp.ops->deinit)
+ 		pci->pp.ops->deinit(&pci->pp);
+@@ -1299,6 +1300,8 @@ int dw_pcie_resume_noirq(struct dw_pcie *pci)
+ 	if (!pci->suspended)
+ 		return 0;
+ 
++	pci->suspended = false;
++
+ 	if (pci->pp.ops->init) {
+ 		ret = pci->pp.ops->init(&pci->pp);
+ 		if (ret) {
+@@ -1320,8 +1323,6 @@ int dw_pcie_resume_noirq(struct dw_pcie *pci)
+ 	if (pci->pp.ops->post_init)
+ 		pci->pp.ops->post_init(&pci->pp);
+ 
+-	pci->suspended = false;
+-
+ 	return 0;
+ 
+ err_stop_link:
+diff --git a/drivers/pci/controller/dwc/pcie-designware-host.c.orig b/drivers/pci/controller/dwc/pcie-designware-host.c.orig
+new file mode 100644
+index 0000000..0672225
+--- /dev/null
++++ b/drivers/pci/controller/dwc/pcie-designware-host.c.orig
+@@ -0,0 +1,1336 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Synopsys DesignWare PCIe host controller driver
++ *
++ * Copyright (C) 2013 Samsung Electronics Co., Ltd.
++ *		https://www.samsung.com
++ *
++ * Author: Jingoo Han <jg1.han@samsung.com>
++ */
++
++#include <linux/align.h>
++#include <linux/iopoll.h>
++#include <linux/irqchip/chained_irq.h>
++#include <linux/irqchip/irq-msi-lib.h>
++#include <linux/irqdomain.h>
++#include <linux/msi.h>
++#include <linux/of_address.h>
++#include <linux/of_pci.h>
++#include <linux/pci.h>
++#include <linux/pci_regs.h>
++#include <linux/platform_device.h>
++
++#include "../pci-host-common.h"
++#include "../../pci.h"
++#include "pcie-designware.h"
++
++static struct pci_ops dw_pcie_ops;
++static struct pci_ops dw_pcie_ecam_ops;
++static struct pci_ops dw_child_pcie_ops;
++
++#ifdef CONFIG_SMP
++static void dw_irq_noop(struct irq_data *d) { }
++#endif
++
++static bool dw_pcie_init_dev_msi_info(struct device *dev, struct irq_domain *domain,
++				      struct irq_domain *real_parent, struct msi_domain_info *info)
++{
++	if (!msi_lib_init_dev_msi_info(dev, domain, real_parent, info))
++		return false;
++
++#ifdef CONFIG_SMP
++	info->chip->irq_ack = dw_irq_noop;
++	info->chip->irq_pre_redirect = irq_chip_pre_redirect_parent;
++#else
++	info->chip->irq_ack = irq_chip_ack_parent;
++#endif
++	return true;
++}
++
++#define DW_PCIE_MSI_FLAGS_REQUIRED (MSI_FLAG_USE_DEF_DOM_OPS		| \
++				    MSI_FLAG_USE_DEF_CHIP_OPS		| \
++				    MSI_FLAG_PCI_MSI_MASK_PARENT)
++#define DW_PCIE_MSI_FLAGS_SUPPORTED (MSI_FLAG_MULTI_PCI_MSI		| \
++				     MSI_FLAG_PCI_MSIX			| \
++				     MSI_GENERIC_FLAGS_MASK)
++
++#define IS_256MB_ALIGNED(x) IS_ALIGNED(x, SZ_256M)
++
++static const struct msi_parent_ops dw_pcie_msi_parent_ops = {
++	.required_flags		= DW_PCIE_MSI_FLAGS_REQUIRED,
++	.supported_flags	= DW_PCIE_MSI_FLAGS_SUPPORTED,
++	.bus_select_token	= DOMAIN_BUS_PCI_MSI,
++	.prefix			= "DW-",
++	.init_dev_msi_info	= dw_pcie_init_dev_msi_info,
++};
++
++/* MSI int handler */
++void dw_handle_msi_irq(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	unsigned int i, num_ctrls;
++
++	num_ctrls = pp->num_vectors / MAX_MSI_IRQS_PER_CTRL;
++
++	for (i = 0; i < num_ctrls; i++) {
++		unsigned int reg_off = i * MSI_REG_CTRL_BLOCK_SIZE;
++		unsigned int irq_off = i * MAX_MSI_IRQS_PER_CTRL;
++		unsigned long status, pos;
++
++		status = dw_pcie_readl_dbi(pci, PCIE_MSI_INTR0_STATUS + reg_off);
++		if (!status)
++			continue;
++
++		for_each_set_bit(pos, &status, MAX_MSI_IRQS_PER_CTRL)
++			generic_handle_demux_domain_irq(pp->irq_domain, irq_off + pos);
++	}
++}
++
++/* Chained MSI interrupt service routine */
++static void dw_chained_msi_isr(struct irq_desc *desc)
++{
++	struct irq_chip *chip = irq_desc_get_chip(desc);
++	struct dw_pcie_rp *pp;
++
++	chained_irq_enter(chip, desc);
++
++	pp = irq_desc_get_handler_data(desc);
++	dw_handle_msi_irq(pp);
++
++	chained_irq_exit(chip, desc);
++}
++
++static void dw_pci_setup_msi_msg(struct irq_data *d, struct msi_msg *msg)
++{
++	struct dw_pcie_rp *pp = irq_data_get_irq_chip_data(d);
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	u64 msi_target = (u64)pp->msi_data;
++
++	msg->address_lo = lower_32_bits(msi_target);
++	msg->address_hi = upper_32_bits(msi_target);
++	msg->data = d->hwirq;
++
++	dev_dbg(pci->dev, "msi#%d address_hi %#x address_lo %#x\n",
++		(int)d->hwirq, msg->address_hi, msg->address_lo);
++}
++
++static void dw_pci_bottom_mask(struct irq_data *d)
++{
++	struct dw_pcie_rp *pp = irq_data_get_irq_chip_data(d);
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	unsigned int res, bit, ctrl;
++
++	guard(raw_spinlock)(&pp->lock);
++	ctrl = d->hwirq / MAX_MSI_IRQS_PER_CTRL;
++	res = ctrl * MSI_REG_CTRL_BLOCK_SIZE;
++	bit = d->hwirq % MAX_MSI_IRQS_PER_CTRL;
++
++	pp->irq_mask[ctrl] |= BIT(bit);
++	dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_MASK + res, pp->irq_mask[ctrl]);
++}
++
++static void dw_pci_bottom_unmask(struct irq_data *d)
++{
++	struct dw_pcie_rp *pp = irq_data_get_irq_chip_data(d);
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	unsigned int res, bit, ctrl;
++
++	guard(raw_spinlock)(&pp->lock);
++	ctrl = d->hwirq / MAX_MSI_IRQS_PER_CTRL;
++	res = ctrl * MSI_REG_CTRL_BLOCK_SIZE;
++	bit = d->hwirq % MAX_MSI_IRQS_PER_CTRL;
++
++	pp->irq_mask[ctrl] &= ~BIT(bit);
++	dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_MASK + res, pp->irq_mask[ctrl]);
++}
++
++static void dw_pci_bottom_ack(struct irq_data *d)
++{
++	struct dw_pcie_rp *pp  = irq_data_get_irq_chip_data(d);
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	unsigned int res, bit, ctrl;
++
++	ctrl = d->hwirq / MAX_MSI_IRQS_PER_CTRL;
++	res = ctrl * MSI_REG_CTRL_BLOCK_SIZE;
++	bit = d->hwirq % MAX_MSI_IRQS_PER_CTRL;
++
++	dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_STATUS + res, BIT(bit));
++}
++
++static struct irq_chip dw_pci_msi_bottom_irq_chip = {
++	.name			= "DWPCI-MSI",
++	.irq_compose_msi_msg	= dw_pci_setup_msi_msg,
++	.irq_mask		= dw_pci_bottom_mask,
++	.irq_unmask		= dw_pci_bottom_unmask,
++#ifdef CONFIG_SMP
++	.irq_ack		= dw_irq_noop,
++	.irq_pre_redirect	= dw_pci_bottom_ack,
++	.irq_set_affinity	= irq_chip_redirect_set_affinity,
++#else
++	.irq_ack		= dw_pci_bottom_ack,
++#endif
++};
++
++static int dw_pcie_irq_domain_alloc(struct irq_domain *domain, unsigned int virq,
++				    unsigned int nr_irqs, void *args)
++{
++	struct dw_pcie_rp *pp = domain->host_data;
++	int bit;
++
++	scoped_guard (raw_spinlock_irq, &pp->lock) {
++		bit = bitmap_find_free_region(pp->msi_irq_in_use, pp->num_vectors,
++					      order_base_2(nr_irqs));
++	}
++
++	if (bit < 0)
++		return -ENOSPC;
++
++	for (unsigned int i = 0; i < nr_irqs; i++) {
++		irq_domain_set_info(domain, virq + i, bit + i, pp->msi_irq_chip,
++				    pp, handle_edge_irq, NULL, NULL);
++	}
++	return 0;
++}
++
++static void dw_pcie_irq_domain_free(struct irq_domain *domain, unsigned int virq,
++				    unsigned int nr_irqs)
++{
++	struct irq_data *d = irq_domain_get_irq_data(domain, virq);
++	struct dw_pcie_rp *pp = domain->host_data;
++
++	guard(raw_spinlock_irq)(&pp->lock);
++	bitmap_release_region(pp->msi_irq_in_use, d->hwirq, order_base_2(nr_irqs));
++}
++
++static const struct irq_domain_ops dw_pcie_msi_domain_ops = {
++	.alloc	= dw_pcie_irq_domain_alloc,
++	.free	= dw_pcie_irq_domain_free,
++};
++
++int dw_pcie_allocate_domains(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct irq_domain_info info = {
++		.fwnode		= dev_fwnode(pci->dev),
++		.ops		= &dw_pcie_msi_domain_ops,
++		.size		= pp->num_vectors,
++		.host_data	= pp,
++	};
++
++	pp->irq_domain = msi_create_parent_irq_domain(&info, &dw_pcie_msi_parent_ops);
++	if (!pp->irq_domain) {
++		dev_err(pci->dev, "Failed to create IRQ domain\n");
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(dw_pcie_allocate_domains);
++
++void dw_pcie_free_msi(struct dw_pcie_rp *pp)
++{
++	u32 ctrl;
++
++	for (ctrl = 0; ctrl < MAX_MSI_CTRLS; ctrl++) {
++		if (pp->msi_irq[ctrl] > 0)
++			irq_set_chained_handler_and_data(pp->msi_irq[ctrl], NULL, NULL);
++	}
++
++	irq_domain_remove(pp->irq_domain);
++}
++EXPORT_SYMBOL_GPL(dw_pcie_free_msi);
++
++void dw_pcie_msi_init(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	u64 msi_target = (u64)pp->msi_data;
++	u32 ctrl, num_ctrls;
++
++	if (!pci_msi_enabled() || !pp->use_imsi_rx)
++		return;
++
++	num_ctrls = pp->num_vectors / MAX_MSI_IRQS_PER_CTRL;
++
++	/* Initialize IRQ Status array */
++	for (ctrl = 0; ctrl < num_ctrls; ctrl++) {
++		dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_MASK +
++				    (ctrl * MSI_REG_CTRL_BLOCK_SIZE),
++				    pp->irq_mask[ctrl]);
++		dw_pcie_writel_dbi(pci, PCIE_MSI_INTR0_ENABLE +
++				    (ctrl * MSI_REG_CTRL_BLOCK_SIZE),
++				    ~0);
++	}
++
++	/* Program the msi_data */
++	dw_pcie_writel_dbi(pci, PCIE_MSI_ADDR_LO, lower_32_bits(msi_target));
++	dw_pcie_writel_dbi(pci, PCIE_MSI_ADDR_HI, upper_32_bits(msi_target));
++}
++EXPORT_SYMBOL_GPL(dw_pcie_msi_init);
++
++static int dw_pcie_parse_split_msi_irq(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct device *dev = pci->dev;
++	struct platform_device *pdev = to_platform_device(dev);
++	u32 ctrl, max_vectors;
++	int irq;
++
++	/* Parse any "msiX" IRQs described in the devicetree */
++	for (ctrl = 0; ctrl < MAX_MSI_CTRLS; ctrl++) {
++		char msi_name[] = "msiX";
++
++		msi_name[3] = '0' + ctrl;
++		irq = platform_get_irq_byname_optional(pdev, msi_name);
++		if (irq == -ENXIO)
++			break;
++		if (irq < 0)
++			return dev_err_probe(dev, irq,
++					     "Failed to parse MSI IRQ '%s'\n",
++					     msi_name);
++
++		pp->msi_irq[ctrl] = irq;
++	}
++
++	/* If no "msiX" IRQs, caller should fallback to "msi" IRQ */
++	if (ctrl == 0)
++		return -ENXIO;
++
++	max_vectors = ctrl * MAX_MSI_IRQS_PER_CTRL;
++	if (pp->num_vectors > max_vectors) {
++		dev_warn(dev, "Exceeding number of MSI vectors, limiting to %u\n",
++			 max_vectors);
++		pp->num_vectors = max_vectors;
++	}
++	if (!pp->num_vectors)
++		pp->num_vectors = max_vectors;
++
++	return 0;
++}
++
++int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct device *dev = pci->dev;
++	struct platform_device *pdev = to_platform_device(dev);
++	u64 *msi_vaddr = NULL;
++	int ret;
++	u32 ctrl, num_ctrls;
++
++	for (ctrl = 0; ctrl < MAX_MSI_CTRLS; ctrl++)
++		pp->irq_mask[ctrl] = ~0;
++
++	if (!pp->msi_irq[0]) {
++		ret = dw_pcie_parse_split_msi_irq(pp);
++		if (ret < 0 && ret != -ENXIO)
++			return ret;
++	}
++
++	if (!pp->num_vectors)
++		pp->num_vectors = MSI_DEF_NUM_VECTORS;
++	num_ctrls = pp->num_vectors / MAX_MSI_IRQS_PER_CTRL;
++
++	if (!pp->msi_irq[0]) {
++		pp->msi_irq[0] = platform_get_irq_byname_optional(pdev, "msi");
++		if (pp->msi_irq[0] < 0) {
++			pp->msi_irq[0] = platform_get_irq(pdev, 0);
++			if (pp->msi_irq[0] < 0)
++				return pp->msi_irq[0];
++		}
++	}
++
++	dev_dbg(dev, "Using %d MSI vectors\n", pp->num_vectors);
++
++	pp->msi_irq_chip = &dw_pci_msi_bottom_irq_chip;
++
++	ret = dw_pcie_allocate_domains(pp);
++	if (ret)
++		return ret;
++
++	for (ctrl = 0; ctrl < num_ctrls; ctrl++) {
++		if (pp->msi_irq[ctrl] > 0)
++			irq_set_chained_handler_and_data(pp->msi_irq[ctrl],
++						    dw_chained_msi_isr, pp);
++	}
++
++	/*
++	 * Even though the iMSI-RX Module supports 64-bit addresses some
++	 * peripheral PCIe devices may lack 64-bit message support. In
++	 * order not to miss MSI TLPs from those devices the MSI target
++	 * address has to be within the lowest 4GB.
++	 *
++	 * Per DWC databook r6.21a, section 3.10.2.3, the incoming MWr TLP
++	 * targeting the MSI_CTRL_ADDR is terminated by the iMSI-RX and never
++	 * appears on the AXI bus. So MSI_CTRL_ADDR address doesn't need to be
++	 * mapped and can be any memory that doesn't get allocated for the BAR
++	 * memory. Since most of the platforms provide 32-bit address for
++	 * 'config' region, try cfg0_base as the first option for the MSI target
++	 * address if it's a 32-bit address. Otherwise, try 32-bit and 64-bit
++	 * coherent memory allocation one by one.
++	 */
++	if (!(pp->cfg0_base & GENMASK_ULL(63, 32))) {
++		pp->msi_data = pp->cfg0_base;
++		return 0;
++	}
++
++	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
++	if (!ret)
++		msi_vaddr = dmam_alloc_coherent(dev, sizeof(u64), &pp->msi_data,
++						GFP_KERNEL);
++
++	if (!msi_vaddr) {
++		dev_warn(dev, "Failed to allocate 32-bit MSI address\n");
++		dma_set_coherent_mask(dev, DMA_BIT_MASK(64));
++		msi_vaddr = dmam_alloc_coherent(dev, sizeof(u64), &pp->msi_data,
++						GFP_KERNEL);
++		if (!msi_vaddr) {
++			dev_err(dev, "Failed to allocate MSI address\n");
++			dw_pcie_free_msi(pp);
++			return -ENOMEM;
++		}
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(dw_pcie_msi_host_init);
++
++static void dw_pcie_host_request_msg_tlp_res(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct resource_entry *win;
++	struct resource *res;
++
++	win = resource_list_first_type(&pp->bridge->windows, IORESOURCE_MEM);
++	if (win) {
++		res = devm_kzalloc(pci->dev, sizeof(*res), GFP_KERNEL);
++		if (!res)
++			return;
++
++		/*
++		 * Allocate MSG TLP region of size 'region_align' at the end of
++		 * the host bridge window.
++		 */
++		res->start = win->res->end - pci->region_align + 1;
++		res->end = win->res->end;
++		res->name = "msg";
++		res->flags = win->res->flags | IORESOURCE_BUSY;
++
++		if (!devm_request_resource(pci->dev, win->res, res))
++			pp->msg_res = res;
++	}
++}
++
++static int dw_pcie_config_ecam_iatu(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct dw_pcie_ob_atu_cfg atu = {0};
++	resource_size_t bus_range_max;
++	struct resource_entry *bus;
++	int ret;
++
++	bus = resource_list_first_type(&pp->bridge->windows, IORESOURCE_BUS);
++
++	/*
++	 * Root bus under the host bridge doesn't require any iATU configuration
++	 * as DBI region will be used to access root bus config space.
++	 * Immediate bus under Root Bus, needs type 0 iATU configuration and
++	 * remaining buses need type 1 iATU configuration.
++	 */
++	atu.index = 0;
++	atu.type = PCIE_TLP_TYPE_CFG0_RDWR;
++	atu.parent_bus_addr = pp->cfg0_base + SZ_1M;
++	/* 1MiB is to cover 1 (bus) * 32 (devices) * 8 (functions) */
++	atu.size = SZ_1M;
++	atu.ctrl2 = PCIE_ATU_CFG_SHIFT_MODE_ENABLE;
++	ret = dw_pcie_prog_outbound_atu(pci, &atu);
++	if (ret)
++		return ret;
++
++	bus_range_max = resource_size(bus->res);
++
++	if (bus_range_max < 2)
++		return 0;
++
++	/* Configure remaining buses in type 1 iATU configuration */
++	atu.index = 1;
++	atu.type = PCIE_TLP_TYPE_CFG1_RDWR;
++	atu.parent_bus_addr = pp->cfg0_base + SZ_2M;
++	atu.size = (SZ_1M * bus_range_max) - SZ_2M;
++	atu.ctrl2 = PCIE_ATU_CFG_SHIFT_MODE_ENABLE;
++
++	return dw_pcie_prog_outbound_atu(pci, &atu);
++}
++
++static int dw_pcie_create_ecam_window(struct dw_pcie_rp *pp, struct resource *res)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct device *dev = pci->dev;
++	struct resource_entry *bus;
++
++	bus = resource_list_first_type(&pp->bridge->windows, IORESOURCE_BUS);
++	if (!bus)
++		return -ENODEV;
++
++	pp->cfg = pci_ecam_create(dev, res, bus->res, &pci_generic_ecam_ops);
++	if (IS_ERR(pp->cfg))
++		return PTR_ERR(pp->cfg);
++
++	return 0;
++}
++
++static bool dw_pcie_ecam_enabled(struct dw_pcie_rp *pp, struct resource *config_res)
++{
++	struct resource *bus_range;
++	u64 nr_buses;
++
++	/* Vendor glue drivers may implement their own ECAM mechanism */
++	if (pp->native_ecam)
++		return false;
++
++	/*
++	 * PCIe spec r6.0, sec 7.2.2 mandates the base address used for ECAM to
++	 * be aligned on a 2^(n+20) byte boundary, where n is the number of bits
++	 * used for representing 'bus' in BDF. Since the DWC cores always use 8
++	 * bits for representing 'bus', the base address has to be aligned to
++	 * 2^28 byte boundary, which is 256 MiB.
++	 */
++	if (!IS_256MB_ALIGNED(config_res->start))
++		return false;
++
++	bus_range = resource_list_first_type(&pp->bridge->windows, IORESOURCE_BUS)->res;
++	if (!bus_range)
++		return false;
++
++	nr_buses = resource_size(config_res) >> PCIE_ECAM_BUS_SHIFT;
++
++	return nr_buses >= resource_size(bus_range);
++}
++
++static int dw_pcie_host_get_resources(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct device *dev = pci->dev;
++	struct platform_device *pdev = to_platform_device(dev);
++	struct resource_entry *win;
++	struct resource *res;
++	int ret;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "config");
++	if (!res) {
++		dev_err(dev, "Missing \"config\" reg space\n");
++		return -ENODEV;
++	}
++
++	pp->cfg0_size = resource_size(res);
++	pp->cfg0_base = res->start;
++
++	pp->ecam_enabled = dw_pcie_ecam_enabled(pp, res);
++	if (pp->ecam_enabled) {
++		ret = dw_pcie_create_ecam_window(pp, res);
++		if (ret)
++			return ret;
++
++		pp->bridge->ops = &dw_pcie_ecam_ops;
++		pp->bridge->sysdata = pp->cfg;
++		pp->cfg->priv = pp;
++	} else {
++		pp->va_cfg0_base = devm_pci_remap_cfg_resource(dev, res);
++		if (IS_ERR(pp->va_cfg0_base))
++			return PTR_ERR(pp->va_cfg0_base);
++
++		/* Set default bus ops */
++		pp->bridge->ops = &dw_pcie_ops;
++		pp->bridge->child_ops = &dw_child_pcie_ops;
++		pp->bridge->sysdata = pp;
++	}
++
++	ret = dw_pcie_get_resources(pci);
++	if (ret) {
++		if (pp->cfg)
++			pci_ecam_free(pp->cfg);
++		return ret;
++	}
++
++	/* Get the I/O range from DT */
++	win = resource_list_first_type(&pp->bridge->windows, IORESOURCE_IO);
++	if (win) {
++		pp->io_size = resource_size(win->res);
++		pp->io_bus_addr = win->res->start - win->offset;
++		pp->io_base = pci_pio_to_address(win->res->start);
++	}
++
++	/*
++	 * visconti_pcie_cpu_addr_fixup() uses pp->io_base, so we have to
++	 * call dw_pcie_parent_bus_offset() after setting pp->io_base.
++	 */
++	pci->parent_bus_offset = dw_pcie_parent_bus_offset(pci, "config",
++							   pp->cfg0_base);
++	return 0;
++}
++
++int dw_pcie_host_init(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct device *dev = pci->dev;
++	struct device_node *np = dev->of_node;
++	struct pci_host_bridge *bridge;
++	int ret;
++
++	raw_spin_lock_init(&pp->lock);
++
++	bridge = devm_pci_alloc_host_bridge(dev, 0);
++	if (!bridge)
++		return -ENOMEM;
++
++	pp->bridge = bridge;
++
++	ret = dw_pcie_host_get_resources(pp);
++	if (ret)
++		return ret;
++
++	if (pp->ops->init) {
++		ret = pp->ops->init(pp);
++		if (ret)
++			goto err_free_ecam;
++	}
++
++	if (pci_msi_enabled()) {
++		pp->use_imsi_rx = !(pp->ops->msi_init ||
++				     of_property_present(np, "msi-parent") ||
++				     of_property_present(np, "msi-map"));
++
++		/*
++		 * For the use_imsi_rx case the default assignment is handled
++		 * in the dw_pcie_msi_host_init().
++		 */
++		if (!pp->use_imsi_rx && !pp->num_vectors) {
++			pp->num_vectors = MSI_DEF_NUM_VECTORS;
++		} else if (pp->num_vectors > MAX_MSI_IRQS) {
++			dev_err(dev, "Invalid number of vectors\n");
++			ret = -EINVAL;
++			goto err_deinit_host;
++		}
++
++		if (pp->ops->msi_init) {
++			ret = pp->ops->msi_init(pp);
++			if (ret < 0)
++				goto err_deinit_host;
++		} else if (pp->use_imsi_rx) {
++			ret = dw_pcie_msi_host_init(pp);
++			if (ret < 0)
++				goto err_deinit_host;
++		}
++	}
++
++	dw_pcie_version_detect(pci);
++
++	dw_pcie_iatu_detect(pci);
++
++	if (pci->num_lanes < 1)
++		pci->num_lanes = dw_pcie_link_get_max_link_width(pci);
++
++	ret = of_pci_get_equalization_presets(dev, &pp->presets, pci->num_lanes);
++	if (ret)
++		goto err_free_msi;
++
++	/*
++	 * Allocate the resource for MSG TLP before programming the iATU
++	 * outbound window in dw_pcie_setup_rc(). Since the allocation depends
++	 * on the value of 'region_align', this has to be done after
++	 * dw_pcie_iatu_detect().
++	 *
++	 * Glue drivers need to set 'use_atu_msg' before dw_pcie_host_init() to
++	 * make use of the generic MSG TLP implementation.
++	 */
++	if (pp->use_atu_msg)
++		dw_pcie_host_request_msg_tlp_res(pp);
++
++	ret = dw_pcie_edma_detect(pci);
++	if (ret)
++		goto err_free_msi;
++
++	ret = dw_pcie_setup_rc(pp);
++	if (ret)
++		goto err_remove_edma;
++
++	if (!dw_pcie_link_up(pci)) {
++		ret = dw_pcie_start_link(pci);
++		if (ret)
++			goto err_remove_edma;
++	}
++
++	/*
++	 * Only fail on timeout error. Other errors indicate the device may
++	 * become available later, so continue without failing.
++	 */
++	ret = dw_pcie_wait_for_link(pci);
++	if (ret == -ETIMEDOUT)
++		goto err_stop_link;
++
++	ret = pci_host_probe(bridge);
++	if (ret)
++		goto err_stop_link;
++
++	if (pp->ops->post_init)
++		pp->ops->post_init(pp);
++
++	dwc_pcie_debugfs_init(pci, DW_PCIE_RC_TYPE);
++
++	return 0;
++
++err_stop_link:
++	dw_pcie_stop_link(pci);
++
++err_remove_edma:
++	dw_pcie_edma_remove(pci);
++
++err_free_msi:
++	if (pp->use_imsi_rx)
++		dw_pcie_free_msi(pp);
++
++err_deinit_host:
++	if (pp->ops->deinit)
++		pp->ops->deinit(pp);
++
++err_free_ecam:
++	if (pp->cfg)
++		pci_ecam_free(pp->cfg);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(dw_pcie_host_init);
++
++void dw_pcie_host_deinit(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++
++	dwc_pcie_debugfs_deinit(pci);
++
++	pci_lock_rescan_remove();
++	pci_stop_root_bus(pp->bridge->bus);
++	pci_remove_root_bus(pp->bridge->bus);
++	pci_unlock_rescan_remove();
++
++	dw_pcie_stop_link(pci);
++
++	dw_pcie_edma_remove(pci);
++
++	if (pp->use_imsi_rx)
++		dw_pcie_free_msi(pp);
++
++	if (pp->ops->deinit)
++		pp->ops->deinit(pp);
++
++	if (pp->cfg)
++		pci_ecam_free(pp->cfg);
++}
++EXPORT_SYMBOL_GPL(dw_pcie_host_deinit);
++
++static void __iomem *dw_pcie_other_conf_map_bus(struct pci_bus *bus,
++						unsigned int devfn, int where)
++{
++	struct dw_pcie_rp *pp = bus->sysdata;
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct dw_pcie_ob_atu_cfg atu = { 0 };
++	int type, ret;
++	u32 busdev;
++
++	/*
++	 * Checking whether the link is up here is a last line of defense
++	 * against platforms that forward errors on the system bus as
++	 * SError upon PCI configuration transactions issued when the link
++	 * is down. This check is racy by definition and does not stop
++	 * the system from triggering an SError if the link goes down
++	 * after this check is performed.
++	 */
++	if (!dw_pcie_link_up(pci))
++		return NULL;
++
++	busdev = PCIE_ATU_BUS(bus->number) | PCIE_ATU_DEV(PCI_SLOT(devfn)) |
++		 PCIE_ATU_FUNC(PCI_FUNC(devfn));
++
++	if (pci_is_root_bus(bus->parent))
++		type = PCIE_TLP_TYPE_CFG0_RDWR;
++	else
++		type = PCIE_TLP_TYPE_CFG1_RDWR;
++
++	atu.type = type;
++	atu.parent_bus_addr = pp->cfg0_base - pci->parent_bus_offset;
++	atu.pci_addr = busdev;
++	atu.size = pp->cfg0_size;
++
++	ret = dw_pcie_prog_outbound_atu(pci, &atu);
++	if (ret)
++		return NULL;
++
++	return pp->va_cfg0_base + where;
++}
++
++static int dw_pcie_rd_other_conf(struct pci_bus *bus, unsigned int devfn,
++				 int where, int size, u32 *val)
++{
++	struct dw_pcie_rp *pp = bus->sysdata;
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct dw_pcie_ob_atu_cfg atu = { 0 };
++	int ret;
++
++	ret = pci_generic_config_read(bus, devfn, where, size, val);
++	if (ret != PCIBIOS_SUCCESSFUL)
++		return ret;
++
++	if (pp->cfg0_io_shared) {
++		atu.type = PCIE_TLP_TYPE_IO_RDWR;
++		atu.parent_bus_addr = pp->io_base - pci->parent_bus_offset;
++		atu.pci_addr = pp->io_bus_addr;
++		atu.size = pp->io_size;
++
++		ret = dw_pcie_prog_outbound_atu(pci, &atu);
++		if (ret)
++			return PCIBIOS_SET_FAILED;
++	}
++
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static int dw_pcie_wr_other_conf(struct pci_bus *bus, unsigned int devfn,
++				 int where, int size, u32 val)
++{
++	struct dw_pcie_rp *pp = bus->sysdata;
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct dw_pcie_ob_atu_cfg atu = { 0 };
++	int ret;
++
++	ret = pci_generic_config_write(bus, devfn, where, size, val);
++	if (ret != PCIBIOS_SUCCESSFUL)
++		return ret;
++
++	if (pp->cfg0_io_shared) {
++		atu.type = PCIE_TLP_TYPE_IO_RDWR;
++		atu.parent_bus_addr = pp->io_base - pci->parent_bus_offset;
++		atu.pci_addr = pp->io_bus_addr;
++		atu.size = pp->io_size;
++
++		ret = dw_pcie_prog_outbound_atu(pci, &atu);
++		if (ret)
++			return PCIBIOS_SET_FAILED;
++	}
++
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static struct pci_ops dw_child_pcie_ops = {
++	.map_bus = dw_pcie_other_conf_map_bus,
++	.read = dw_pcie_rd_other_conf,
++	.write = dw_pcie_wr_other_conf,
++};
++
++void __iomem *dw_pcie_own_conf_map_bus(struct pci_bus *bus, unsigned int devfn, int where)
++{
++	struct dw_pcie_rp *pp = bus->sysdata;
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++
++	if (PCI_SLOT(devfn) > 0)
++		return NULL;
++
++	return pci->dbi_base + where;
++}
++EXPORT_SYMBOL_GPL(dw_pcie_own_conf_map_bus);
++
++static void __iomem *dw_pcie_ecam_conf_map_bus(struct pci_bus *bus, unsigned int devfn, int where)
++{
++	struct pci_config_window *cfg = bus->sysdata;
++	struct dw_pcie_rp *pp = cfg->priv;
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	unsigned int busn = bus->number;
++
++	if (busn > 0)
++		return pci_ecam_map_bus(bus, devfn, where);
++
++	if (PCI_SLOT(devfn) > 0)
++		return NULL;
++
++	return pci->dbi_base + where;
++}
++
++static struct pci_ops dw_pcie_ops = {
++	.map_bus = dw_pcie_own_conf_map_bus,
++	.read = pci_generic_config_read,
++	.write = pci_generic_config_write,
++};
++
++static struct pci_ops dw_pcie_ecam_ops = {
++	.map_bus = dw_pcie_ecam_conf_map_bus,
++	.read = pci_generic_config_read,
++	.write = pci_generic_config_write,
++};
++
++static int dw_pcie_iatu_setup(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct dw_pcie_ob_atu_cfg atu = { 0 };
++	struct resource_entry *entry;
++	int ob_iatu_index;
++	int ib_iatu_index;
++	int i, ret;
++
++	if (!pci->num_ob_windows) {
++		dev_err(pci->dev, "No outbound iATU found\n");
++		return -EINVAL;
++	}
++
++	/*
++	 * Ensure all out/inbound windows are disabled before proceeding with
++	 * the MEM/IO (dma-)ranges setups.
++	 */
++	for (i = 0; i < pci->num_ob_windows; i++)
++		dw_pcie_disable_atu(pci, PCIE_ATU_REGION_DIR_OB, i);
++
++	for (i = 0; i < pci->num_ib_windows; i++)
++		dw_pcie_disable_atu(pci, PCIE_ATU_REGION_DIR_IB, i);
++
++	/*
++	 * NOTE: For outbound address translation, outbound iATU at index 0 is
++	 * reserved for CFG IOs (dw_pcie_other_conf_map_bus()), thus start at
++	 * index 1.
++	 *
++	 * If using ECAM, outbound iATU at index 0 and index 1 is reserved for
++	 * CFG IOs.
++	 */
++	if (pp->ecam_enabled) {
++		ob_iatu_index = 2;
++		ret = dw_pcie_config_ecam_iatu(pp);
++		if (ret) {
++			dev_err(pci->dev, "Failed to configure iATU in ECAM mode\n");
++			return ret;
++		}
++	} else {
++		ob_iatu_index = 1;
++	}
++
++	resource_list_for_each_entry(entry, &pp->bridge->windows) {
++		resource_size_t res_size;
++
++		if (resource_type(entry->res) != IORESOURCE_MEM)
++			continue;
++
++		atu.type = PCIE_TLP_TYPE_MEM_RDWR;
++		atu.parent_bus_addr = entry->res->start - pci->parent_bus_offset;
++		atu.pci_addr = entry->res->start - entry->offset;
++
++		/* Adjust iATU size if MSG TLP region was allocated before */
++		if (pp->msg_res && pp->msg_res->parent == entry->res)
++			res_size = resource_size(entry->res) -
++					resource_size(pp->msg_res);
++		else
++			res_size = resource_size(entry->res);
++
++		while (res_size > 0) {
++			/*
++			 * Return failure if we run out of windows in the
++			 * middle. Otherwise, we would end up only partially
++			 * mapping a single resource.
++			 */
++			if (ob_iatu_index >= pci->num_ob_windows) {
++				dev_err(pci->dev, "Cannot add outbound window for region: %pr\n",
++					entry->res);
++				return -ENOMEM;
++			}
++
++			atu.index = ob_iatu_index;
++			atu.size = MIN(pci->region_limit + 1, res_size);
++
++			ret = dw_pcie_prog_outbound_atu(pci, &atu);
++			if (ret) {
++				dev_err(pci->dev, "Failed to set MEM range %pr\n",
++					entry->res);
++				return ret;
++			}
++
++			ob_iatu_index++;
++			atu.parent_bus_addr += atu.size;
++			atu.pci_addr += atu.size;
++			res_size -= atu.size;
++		}
++	}
++
++	if (pp->io_size) {
++		if (ob_iatu_index < pci->num_ob_windows) {
++			atu.index = ob_iatu_index;
++			atu.type = PCIE_TLP_TYPE_IO_RDWR;
++			atu.parent_bus_addr = pp->io_base - pci->parent_bus_offset;
++			atu.pci_addr = pp->io_bus_addr;
++			atu.size = pp->io_size;
++
++			ret = dw_pcie_prog_outbound_atu(pci, &atu);
++			if (ret) {
++				dev_err(pci->dev, "Failed to set IO range %pr\n",
++					entry->res);
++				return ret;
++			}
++			ob_iatu_index++;
++		} else {
++			/*
++			 * If there are not enough outbound windows to give I/O
++			 * space its own iATU, the outbound iATU at index 0 will
++			 * be shared between I/O space and CFG IOs, by
++			 * temporarily reconfiguring the iATU to CFG space, in
++			 * order to do a CFG IO, and then immediately restoring
++			 * it to I/O space. This is only implemented when using
++			 * dw_pcie_other_conf_map_bus(), which is not the case
++			 * when using ECAM.
++			 */
++			if (pp->ecam_enabled) {
++				dev_err(pci->dev, "Cannot add outbound window for I/O\n");
++				return -ENOMEM;
++			}
++			pp->cfg0_io_shared = true;
++		}
++	}
++
++	if (pp->use_atu_msg) {
++		if (ob_iatu_index >= pci->num_ob_windows) {
++			dev_err(pci->dev, "Cannot add outbound window for MSG TLP\n");
++			return -ENOMEM;
++		}
++		pp->msg_atu_index = ob_iatu_index++;
++	}
++
++	ib_iatu_index = 0;
++	resource_list_for_each_entry(entry, &pp->bridge->dma_ranges) {
++		resource_size_t res_start, res_size, window_size;
++
++		if (resource_type(entry->res) != IORESOURCE_MEM)
++			continue;
++
++		res_size = resource_size(entry->res);
++		res_start = entry->res->start;
++		while (res_size > 0) {
++			/*
++			 * Return failure if we run out of windows in the
++			 * middle. Otherwise, we would end up only partially
++			 * mapping a single resource.
++			 */
++			if (ib_iatu_index >= pci->num_ib_windows) {
++				dev_err(pci->dev, "Cannot add inbound window for region: %pr\n",
++					entry->res);
++				return -ENOMEM;
++			}
++
++			window_size = MIN(pci->region_limit + 1, res_size);
++			ret = dw_pcie_prog_inbound_atu(pci, ib_iatu_index,
++						       PCIE_TLP_TYPE_MEM_RDWR, res_start,
++						       res_start - entry->offset, window_size);
++			if (ret) {
++				dev_err(pci->dev, "Failed to set DMA range %pr\n",
++					entry->res);
++				return ret;
++			}
++
++			ib_iatu_index++;
++			res_start += window_size;
++			res_size -= window_size;
++		}
++	}
++
++	return 0;
++}
++
++static void dw_pcie_program_presets(struct dw_pcie_rp *pp, enum pci_bus_speed speed)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	u8 lane_eq_offset, lane_reg_size, cap_id;
++	u8 *presets;
++	u32 cap;
++	int i;
++
++	if (speed == PCIE_SPEED_8_0GT) {
++		presets = (u8 *)pp->presets.eq_presets_8gts;
++		lane_eq_offset =  PCI_SECPCI_LE_CTRL;
++		cap_id = PCI_EXT_CAP_ID_SECPCI;
++		/* For data rate of 8 GT/S each lane equalization control is 16bits wide*/
++		lane_reg_size = 0x2;
++	} else if (speed == PCIE_SPEED_16_0GT) {
++		presets = pp->presets.eq_presets_Ngts[EQ_PRESET_TYPE_16GTS - 1];
++		lane_eq_offset = PCI_PL_16GT_LE_CTRL;
++		cap_id = PCI_EXT_CAP_ID_PL_16GT;
++		lane_reg_size = 0x1;
++	} else if (speed == PCIE_SPEED_32_0GT) {
++		presets =  pp->presets.eq_presets_Ngts[EQ_PRESET_TYPE_32GTS - 1];
++		lane_eq_offset = PCI_PL_32GT_LE_CTRL;
++		cap_id = PCI_EXT_CAP_ID_PL_32GT;
++		lane_reg_size = 0x1;
++	} else if (speed == PCIE_SPEED_64_0GT) {
++		presets =  pp->presets.eq_presets_Ngts[EQ_PRESET_TYPE_64GTS - 1];
++		lane_eq_offset = PCI_PL_64GT_LE_CTRL;
++		cap_id = PCI_EXT_CAP_ID_PL_64GT;
++		lane_reg_size = 0x1;
++	} else {
++		return;
++	}
++
++	if (presets[0] == PCI_EQ_RESV)
++		return;
++
++	cap = dw_pcie_find_ext_capability(pci, cap_id);
++	if (!cap)
++		return;
++
++	/*
++	 * Write preset values to the registers byte-by-byte for the given
++	 * number of lanes and register size.
++	 */
++	for (i = 0; i < pci->num_lanes * lane_reg_size; i++)
++		dw_pcie_writeb_dbi(pci, cap + lane_eq_offset + i, presets[i]);
++}
++
++static void dw_pcie_config_presets(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	enum pci_bus_speed speed = pcie_get_link_speed(pci->max_link_speed);
++
++	/*
++	 * Lane equalization settings need to be applied for all data rates the
++	 * controller supports and for all supported lanes.
++	 */
++
++	if (speed >= PCIE_SPEED_8_0GT)
++		dw_pcie_program_presets(pp, PCIE_SPEED_8_0GT);
++
++	if (speed >= PCIE_SPEED_16_0GT)
++		dw_pcie_program_presets(pp, PCIE_SPEED_16_0GT);
++
++	if (speed >= PCIE_SPEED_32_0GT)
++		dw_pcie_program_presets(pp, PCIE_SPEED_32_0GT);
++
++	if (speed >= PCIE_SPEED_64_0GT)
++		dw_pcie_program_presets(pp, PCIE_SPEED_64_0GT);
++}
++
++int dw_pcie_setup_rc(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	u32 val;
++	int ret;
++
++	/*
++	 * Enable DBI read-only registers for writing/updating configuration.
++	 * Write permission gets disabled towards the end of this function.
++	 */
++	dw_pcie_dbi_ro_wr_en(pci);
++
++	dw_pcie_setup(pci);
++
++	dw_pcie_msi_init(pp);
++
++	/* Setup RC BARs */
++	dw_pcie_writel_dbi(pci, PCI_BASE_ADDRESS_0, 0x00000004);
++	dw_pcie_writel_dbi(pci, PCI_BASE_ADDRESS_1, 0x00000000);
++
++	/* Setup interrupt pins */
++	val = dw_pcie_readl_dbi(pci, PCI_INTERRUPT_LINE);
++	val &= 0xffff00ff;
++	val |= 0x00000100;
++	dw_pcie_writel_dbi(pci, PCI_INTERRUPT_LINE, val);
++
++	/* Setup bus numbers */
++	val = dw_pcie_readl_dbi(pci, PCI_PRIMARY_BUS);
++	val &= 0xff000000;
++	val |= 0x00ff0100;
++	dw_pcie_writel_dbi(pci, PCI_PRIMARY_BUS, val);
++
++	/* Setup command register */
++	val = dw_pcie_readl_dbi(pci, PCI_COMMAND);
++	val &= 0xffff0000;
++	val |= PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
++		PCI_COMMAND_MASTER | PCI_COMMAND_SERR;
++	dw_pcie_writel_dbi(pci, PCI_COMMAND, val);
++
++	dw_pcie_hide_unsupported_l1ss(pci);
++
++	dw_pcie_config_presets(pp);
++	/*
++	 * If the platform provides its own child bus config accesses, it means
++	 * the platform uses its own address translation component rather than
++	 * ATU, so we should not program the ATU here.
++	 */
++	if (pp->bridge->child_ops == &dw_child_pcie_ops || pp->ecam_enabled) {
++		ret = dw_pcie_iatu_setup(pp);
++		if (ret)
++			return ret;
++	}
++
++	dw_pcie_writel_dbi(pci, PCI_BASE_ADDRESS_0, 0);
++
++	/* Program correct class for RC */
++	dw_pcie_writew_dbi(pci, PCI_CLASS_DEVICE, PCI_CLASS_BRIDGE_PCI);
++
++	val = dw_pcie_readl_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL);
++	val |= PORT_LOGIC_SPEED_CHANGE;
++	dw_pcie_writel_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL, val);
++
++	dw_pcie_dbi_ro_wr_dis(pci);
++
++	/*
++	 * The iMSI-RX module does not support receiving MSI or MSI-X generated
++	 * by the Root Port. If iMSI-RX is used as the MSI controller, remove
++	 * the MSI and MSI-X capabilities of the Root Port to allow the drivers
++	 * to fall back to INTx instead.
++	 */
++	if (pp->use_imsi_rx && !pp->keep_rp_msi_en) {
++		dw_pcie_remove_capability(pci, PCI_CAP_ID_MSI);
++		dw_pcie_remove_capability(pci, PCI_CAP_ID_MSIX);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(dw_pcie_setup_rc);
++
++static int dw_pcie_pme_turn_off(struct dw_pcie *pci)
++{
++	struct dw_pcie_ob_atu_cfg atu = { 0 };
++	void __iomem *mem;
++	int ret;
++
++	if (pci->num_ob_windows <= pci->pp.msg_atu_index)
++		return -ENOSPC;
++
++	if (!pci->pp.msg_res)
++		return -ENOSPC;
++
++	atu.code = PCIE_MSG_CODE_PME_TURN_OFF;
++	atu.routing = PCIE_MSG_TYPE_R_BC;
++	atu.type = PCIE_TLP_TYPE_MSG;
++	atu.size = resource_size(pci->pp.msg_res);
++	atu.index = pci->pp.msg_atu_index;
++
++	atu.parent_bus_addr = pci->pp.msg_res->start - pci->parent_bus_offset;
++
++	ret = dw_pcie_prog_outbound_atu(pci, &atu);
++	if (ret)
++		return ret;
++
++	mem = ioremap(pci->pp.msg_res->start, pci->region_align);
++	if (!mem)
++		return -ENOMEM;
++
++	/* A dummy write is converted to a Msg TLP */
++	writel(0, mem);
++
++	iounmap(mem);
++
++	return 0;
++}
++
++int dw_pcie_suspend_noirq(struct dw_pcie *pci)
++{
++	bool pme_capable = false;
++	int ret = 0;
++	u32 val;
++
++	if (!dw_pcie_link_up(pci))
++		goto stop_link;
++
++	if (!pci_host_common_d3cold_possible(pci->pp.bridge, &pme_capable))
++		return 0;
++
++	if (pci->pp.ops->pme_turn_off) {
++		pci->pp.ops->pme_turn_off(&pci->pp);
++	} else {
++		ret = dw_pcie_pme_turn_off(pci);
++		if (ret)
++			return ret;
++	}
++
++	/*
++	 * Some SoCs do not support reading the LTSSM register after
++	 * PME_Turn_Off broadcast. For those SoCs, skip waiting for L2/L3 Ready
++	 * state and wait 10ms as recommended in PCIe spec r6.0, sec 5.3.3.2.1.
++	 */
++	if (pci->pp.skip_l23_ready) {
++		mdelay(PCIE_PME_TO_L2_TIMEOUT_US/1000);
++		goto stop_link;
++	}
++
++	ret = read_poll_timeout(dw_pcie_get_ltssm, val,
++				val == DW_PCIE_LTSSM_L2_IDLE ||
++				val <= DW_PCIE_LTSSM_DETECT_WAIT,
++				PCIE_PME_TO_L2_TIMEOUT_US/10,
++				PCIE_PME_TO_L2_TIMEOUT_US, false, pci);
++	if (ret) {
++		/*
++		 * Failure is non-fatal since spec r7.0, sec 5.3.3.2.1,
++		 * recommends proceeding with L2/L3 sequence even if one or more
++		 * devices do not respond with PME_TO_Ack after 10ms timeout.
++		 */
++		dev_warn(pci->dev, "Timeout waiting for L2 entry! LTSSM: 0x%x\n", val);
++		ret = 0;
++	}
++
++	/*
++	 * Per PCIe r6.0, sec 5.3.3.2.1, software should wait at least
++	 * 100ns after L2/L3 Ready before turning off refclock and
++	 * main power. This is harmless when no endpoint is connected.
++	 */
++	udelay(1);
++
++stop_link:
++	/*
++	 * TODO: "pme_capable" means some downstream device is wakeup-
++	 * enabled and is capable of generating PME from D3cold, which
++	 * requires auxiliary power.  Instead of always skipping power off
++	 * if PME is supported from D3cold, query the pwrctrl core and skip
++	 * power off only if device supports PME from D3cold and Vaux is
++	 * not supported.
++	 */
++	pci->pp.skip_pwrctrl_off = pme_capable;
++	dw_pcie_stop_link(pci);
++	if (pci->pp.ops->deinit)
++		pci->pp.ops->deinit(&pci->pp);
++
++	pci->suspended = true;
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(dw_pcie_suspend_noirq);
++
++int dw_pcie_resume_noirq(struct dw_pcie *pci)
++{
++	int ret;
++
++	if (!pci->suspended)
++		return 0;
++
++	if (pci->pp.ops->init) {
++		ret = pci->pp.ops->init(&pci->pp);
++		if (ret) {
++			dev_err(pci->dev, "Host init failed: %d\n", ret);
++			return ret;
++		}
++	}
++
++	dw_pcie_setup_rc(&pci->pp);
++
++	ret = dw_pcie_start_link(pci);
++	if (ret)
++		goto err_deinit;
++
++	ret = dw_pcie_wait_for_link(pci);
++	if (ret == -ETIMEDOUT)
++		goto err_stop_link;
++
++	if (pci->pp.ops->post_init)
++		pci->pp.ops->post_init(&pci->pp);
++
++	pci->suspended = false;
++
++	return 0;
++
++err_stop_link:
++	dw_pcie_stop_link(pci);
++
++err_deinit:
++	if (pci->pp.ops->deinit)
++		pci->pp.ops->deinit(&pci->pp);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(dw_pcie_resume_noirq);
+diff --git a/drivers/pci/controller/dwc/pcie-designware.h b/drivers/pci/controller/dwc/pcie-designware.h
+index de4b245..27bc757 100644
+--- a/drivers/pci/controller/dwc/pcie-designware.h
++++ b/drivers/pci/controller/dwc/pcie-designware.h
+@@ -470,7 +470,6 @@ struct dw_pcie_rp {
+ 	bool			ecam_enabled;
+ 	bool			native_ecam;
+ 	bool                    skip_l23_ready;
+-	bool			skip_pwrctrl_off;
+ };
+ 
+ struct dw_pcie_ep_ops {
+diff --git a/drivers/pci/controller/dwc/pcie-designware.h.orig b/drivers/pci/controller/dwc/pcie-designware.h.orig
+new file mode 100644
+index 0000000..de4b245
+--- /dev/null
++++ b/drivers/pci/controller/dwc/pcie-designware.h.orig
+@@ -0,0 +1,1015 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Synopsys DesignWare PCIe host controller driver
++ *
++ * Copyright (C) 2013 Samsung Electronics Co., Ltd.
++ *		https://www.samsung.com
++ *
++ * Author: Jingoo Han <jg1.han@samsung.com>
++ */
++
++#ifndef _PCIE_DESIGNWARE_H
++#define _PCIE_DESIGNWARE_H
++
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/clk.h>
++#include <linux/dma-mapping.h>
++#include <linux/dma/edma.h>
++#include <linux/gpio/consumer.h>
++#include <linux/irq.h>
++#include <linux/msi.h>
++#include <linux/pci.h>
++#include <linux/pci-ecam.h>
++#include <linux/reset.h>
++
++#include <linux/pci-epc.h>
++#include <linux/pci-epf.h>
++
++#include "../../pci.h"
++
++/* DWC PCIe IP-core versions (native support since v4.70a) */
++#define DW_PCIE_VER_365A		0x3336352a
++#define DW_PCIE_VER_460A		0x3436302a
++#define DW_PCIE_VER_470A		0x3437302a
++#define DW_PCIE_VER_480A		0x3438302a
++#define DW_PCIE_VER_490A		0x3439302a
++#define DW_PCIE_VER_500A		0x3530302a
++#define DW_PCIE_VER_510A		0x3531302a
++#define DW_PCIE_VER_520A		0x3532302a
++#define DW_PCIE_VER_540A		0x3534302a
++#define DW_PCIE_VER_562A		0x3536322a
++
++#define __dw_pcie_ver_cmp(_pci, _ver, _op) \
++	((_pci)->version _op DW_PCIE_VER_ ## _ver)
++
++#define dw_pcie_ver_is(_pci, _ver) __dw_pcie_ver_cmp(_pci, _ver, ==)
++
++#define dw_pcie_ver_is_ge(_pci, _ver) __dw_pcie_ver_cmp(_pci, _ver, >=)
++
++#define dw_pcie_ver_type_is(_pci, _ver, _type) \
++	(__dw_pcie_ver_cmp(_pci, _ver, ==) && \
++	 __dw_pcie_ver_cmp(_pci, TYPE_ ## _type, ==))
++
++#define dw_pcie_ver_type_is_ge(_pci, _ver, _type) \
++	(__dw_pcie_ver_cmp(_pci, _ver, ==) && \
++	 __dw_pcie_ver_cmp(_pci, TYPE_ ## _type, >=))
++
++/* DWC PCIe controller capabilities */
++#define DW_PCIE_CAP_REQ_RES		0
++#define DW_PCIE_CAP_IATU_UNROLL		1
++#define DW_PCIE_CAP_CDM_CHECK		2
++
++#define dw_pcie_cap_is(_pci, _cap) \
++	test_bit(DW_PCIE_CAP_ ## _cap, &(_pci)->caps)
++
++#define dw_pcie_cap_set(_pci, _cap) \
++	set_bit(DW_PCIE_CAP_ ## _cap, &(_pci)->caps)
++
++/* Parameters for the waiting for iATU enabled routine */
++#define LINK_WAIT_MAX_IATU_RETRIES	5
++#define LINK_WAIT_IATU			9
++
++/* Synopsys-specific PCIe configuration registers */
++#define PCIE_PORT_FORCE			0x708
++/* Bit[7:0] LINK_NUM: Link Number. Not used for endpoint */
++#define PORT_LINK_NUM_MASK		GENMASK(7, 0)
++#define PORT_FORCE_DO_DESKEW_FOR_SRIS	BIT(23)
++
++#define PCIE_PORT_AFR			0x70C
++#define PORT_AFR_N_FTS_MASK		GENMASK(15, 8)
++#define PORT_AFR_N_FTS(n)		FIELD_PREP(PORT_AFR_N_FTS_MASK, n)
++#define PORT_AFR_CC_N_FTS_MASK		GENMASK(23, 16)
++#define PORT_AFR_CC_N_FTS(n)		FIELD_PREP(PORT_AFR_CC_N_FTS_MASK, n)
++#define PORT_AFR_ENTER_ASPM		BIT(30)
++#define PORT_AFR_L0S_ENTRANCE_LAT_SHIFT	24
++#define PORT_AFR_L0S_ENTRANCE_LAT_MASK	GENMASK(26, 24)
++#define PORT_AFR_L1_ENTRANCE_LAT_SHIFT	27
++#define PORT_AFR_L1_ENTRANCE_LAT_MASK	GENMASK(29, 27)
++
++#define PCIE_PORT_LINK_CONTROL		0x710
++#define PORT_LINK_DLL_LINK_EN		BIT(5)
++#define PORT_LINK_FAST_LINK_MODE	BIT(7)
++#define PORT_LINK_MODE_MASK		GENMASK(21, 16)
++#define PORT_LINK_MODE(n)		FIELD_PREP(PORT_LINK_MODE_MASK, n)
++#define PORT_LINK_MODE_1_LANES		PORT_LINK_MODE(0x1)
++#define PORT_LINK_MODE_2_LANES		PORT_LINK_MODE(0x3)
++#define PORT_LINK_MODE_4_LANES		PORT_LINK_MODE(0x7)
++#define PORT_LINK_MODE_8_LANES		PORT_LINK_MODE(0xf)
++#define PORT_LINK_MODE_16_LANES		PORT_LINK_MODE(0x1f)
++
++#define PCIE_PORT_LANE_SKEW		0x714
++#define PORT_LANE_SKEW_INSERT_MASK	GENMASK(23, 0)
++
++/*
++ * PCIE_TIMER_CTRL_MAX_FUNC_NUM: Timer Control and Max Function Number
++ * Register.
++ *
++ * This register holds the ack frequency, latency, replay, fast link
++ * scaling timers, and max function number values.
++ *
++ * Bit[30:29] FAST_LINK_SCALING_FACTOR: Fast Link Timer Scaling Factor.
++ *   0x0 (SF_1024): Scaling Factor is 1024 (1ms is 1us).
++ *     When the LTSSM is in Config or L12 Entry State, 1ms
++ *     timer is 2us, 2ms timer is 4us and 3ms timer is 6us.
++ *   0x1 (SF_256): Scaling Factor is 256 (1ms is 4us)
++ *   0x2 (SF_64): Scaling Factor is 64 (1ms is 16us)
++ *   0x3 (SF_16): Scaling Factor is 16 (1ms is 64us)
++ */
++#define PCIE_TIMER_CTRL_MAX_FUNC_NUM	0x718
++#define PORT_FLT_SF_MASK	GENMASK(30, 29)
++#define PORT_FLT_SF_VAL_1024	0x0
++#define PORT_FLT_SF_VAL_256	0x1
++#define PORT_FLT_SF_VAL_64	0x2
++#define PORT_FLT_SF_VAL_16	0x3
++
++#define PCIE_PORT_DEBUG0		0x728
++#define PORT_LOGIC_LTSSM_STATE_MASK	0x3f
++#define PORT_LOGIC_LTSSM_STATE_L0	0x11
++#define PCIE_PORT_DEBUG1		0x72C
++#define PCIE_PORT_DEBUG1_LINK_UP		BIT(4)
++#define PCIE_PORT_DEBUG1_LINK_IN_TRAINING	BIT(29)
++
++#define PCIE_LINK_WIDTH_SPEED_CONTROL	0x80C
++#define PORT_LOGIC_N_FTS_MASK		GENMASK(7, 0)
++#define PORT_LOGIC_SPEED_CHANGE		BIT(17)
++#define PORT_LOGIC_LINK_WIDTH_MASK	GENMASK(12, 8)
++#define PORT_LOGIC_LINK_WIDTH(n)	FIELD_PREP(PORT_LOGIC_LINK_WIDTH_MASK, n)
++#define PORT_LOGIC_LINK_WIDTH_1_LANES	PORT_LOGIC_LINK_WIDTH(0x1)
++#define PORT_LOGIC_LINK_WIDTH_2_LANES	PORT_LOGIC_LINK_WIDTH(0x2)
++#define PORT_LOGIC_LINK_WIDTH_4_LANES	PORT_LOGIC_LINK_WIDTH(0x4)
++#define PORT_LOGIC_LINK_WIDTH_8_LANES	PORT_LOGIC_LINK_WIDTH(0x8)
++
++#define PCIE_MSI_ADDR_LO		0x820
++#define PCIE_MSI_ADDR_HI		0x824
++#define PCIE_MSI_INTR0_ENABLE		0x828
++#define PCIE_MSI_INTR0_MASK		0x82C
++#define PCIE_MSI_INTR0_STATUS		0x830
++
++#define GEN3_RELATED_OFF			0x890
++#define GEN3_RELATED_OFF_GEN3_ZRXDC_NONCOMPL	BIT(0)
++#define GEN3_RELATED_OFF_EQ_PHASE_2_3		BIT(9)
++#define GEN3_RELATED_OFF_RXEQ_RGRDLESS_RXTS	BIT(13)
++#define GEN3_RELATED_OFF_GEN3_EQ_DISABLE	BIT(16)
++#define GEN3_RELATED_OFF_RATE_SHADOW_SEL_SHIFT	24
++#define GEN3_RELATED_OFF_RATE_SHADOW_SEL_MASK	GENMASK(25, 24)
++
++#define GEN3_EQ_CONTROL_OFF			0x8A8
++#define GEN3_EQ_CONTROL_OFF_FB_MODE		GENMASK(3, 0)
++#define GEN3_EQ_CONTROL_OFF_PHASE23_EXIT_MODE	BIT(4)
++#define GEN3_EQ_CONTROL_OFF_PSET_REQ_VEC	GENMASK(23, 8)
++#define GEN3_EQ_CONTROL_OFF_FOM_INC_INITIAL_EVAL	BIT(24)
++
++#define GEN3_EQ_FB_MODE_DIR_CHANGE_OFF		0x8AC
++#define GEN3_EQ_FMDC_T_MIN_PHASE23		GENMASK(4, 0)
++#define GEN3_EQ_FMDC_N_EVALS			GENMASK(9, 5)
++#define GEN3_EQ_FMDC_MAX_PRE_CURSOR_DELTA	GENMASK(13, 10)
++#define GEN3_EQ_FMDC_MAX_POST_CURSOR_DELTA	GENMASK(17, 14)
++
++#define COHERENCY_CONTROL_1_OFF			0x8E0
++#define CFG_MEMTYPE_BOUNDARY_LOW_ADDR_MASK	GENMASK(31, 2)
++#define CFG_MEMTYPE_VALUE			BIT(0)
++
++#define COHERENCY_CONTROL_2_OFF			0x8E4
++#define COHERENCY_CONTROL_3_OFF			0x8E8
++
++#define PCIE_PORT_MULTI_LANE_CTRL	0x8C0
++#define PORT_MLTI_UPCFG_SUPPORT		BIT(7)
++
++#define PCIE_VERSION_NUMBER		0x8F8
++#define PCIE_VERSION_TYPE		0x8FC
++
++/*
++ * iATU inbound and outbound windows CSRs. Before the IP-core v4.80a each
++ * iATU region CSRs had been indirectly accessible by means of the dedicated
++ * viewport selector. The iATU/eDMA CSRs space was re-designed in DWC PCIe
++ * v4.80a in a way so the viewport was unrolled into the directly accessible
++ * iATU/eDMA CSRs space.
++ */
++#define PCIE_ATU_VIEWPORT		0x900
++#define PCIE_ATU_REGION_DIR_IB		BIT(31)
++#define PCIE_ATU_REGION_DIR_OB		0
++#define PCIE_ATU_VIEWPORT_BASE		0x904
++#define PCIE_ATU_UNROLL_BASE(dir, index) \
++	(((index) << 9) | ((dir == PCIE_ATU_REGION_DIR_IB) ? BIT(8) : 0))
++#define PCIE_ATU_VIEWPORT_SIZE		0x2C
++#define PCIE_ATU_REGION_CTRL1		0x000
++#define PCIE_ATU_INCREASE_REGION_SIZE	BIT(13)
++#define PCIE_ATU_TD			BIT(8)
++#define PCIE_ATU_FUNC_NUM(pf)           ((pf) << 20)
++#define PCIE_ATU_REGION_CTRL2		0x004
++#define PCIE_ATU_ENABLE			BIT(31)
++#define PCIE_ATU_BAR_MODE_ENABLE	BIT(30)
++#define PCIE_ATU_CFG_SHIFT_MODE_ENABLE	BIT(28)
++#define PCIE_ATU_INHIBIT_PAYLOAD	BIT(22)
++#define PCIE_ATU_FUNC_NUM_MATCH_EN      BIT(19)
++#define PCIE_ATU_LOWER_BASE		0x008
++#define PCIE_ATU_UPPER_BASE		0x00C
++#define PCIE_ATU_LIMIT			0x010
++#define PCIE_ATU_LOWER_TARGET		0x014
++#define PCIE_ATU_BUS(x)			FIELD_PREP(GENMASK(31, 24), x)
++#define PCIE_ATU_DEV(x)			FIELD_PREP(GENMASK(23, 19), x)
++#define PCIE_ATU_FUNC(x)		FIELD_PREP(GENMASK(18, 16), x)
++#define PCIE_ATU_UPPER_TARGET		0x018
++#define PCIE_ATU_UPPER_LIMIT		0x020
++
++#define PCIE_MISC_CONTROL_1_OFF		0x8BC
++#define PCIE_DBI_RO_WR_EN		BIT(0)
++
++#define PCIE_MSIX_DOORBELL		0x948
++#define PCIE_MSIX_DOORBELL_PF_SHIFT	24
++
++/*
++ * eDMA CSRs. DW PCIe IP-core v4.70a and older had the eDMA registers accessible
++ * over the Port Logic registers space. Afterwards the unrolled mapping was
++ * introduced so eDMA and iATU could be accessed via a dedicated registers
++ * space.
++ */
++#define PCIE_DMA_VIEWPORT_BASE		0x970
++#define PCIE_DMA_UNROLL_BASE		0x80000
++#define PCIE_DMA_CTRL			0x008
++#define PCIE_DMA_NUM_WR_CHAN		GENMASK(3, 0)
++#define PCIE_DMA_NUM_RD_CHAN		GENMASK(19, 16)
++
++#define PCIE_PL_CHK_REG_CONTROL_STATUS			0xB20
++#define PCIE_PL_CHK_REG_CHK_REG_START			BIT(0)
++#define PCIE_PL_CHK_REG_CHK_REG_CONTINUOUS		BIT(1)
++#define PCIE_PL_CHK_REG_CHK_REG_COMPARISON_ERROR	BIT(16)
++#define PCIE_PL_CHK_REG_CHK_REG_LOGIC_ERROR		BIT(17)
++#define PCIE_PL_CHK_REG_CHK_REG_COMPLETE		BIT(18)
++
++#define PCIE_PL_CHK_REG_ERR_ADDR			0xB28
++
++/*
++ * 16.0 GT/s (Gen 4) lane margining register definitions
++ */
++#define GEN4_LANE_MARGINING_1_OFF		0xB80
++#define MARGINING_MAX_VOLTAGE_OFFSET		GENMASK(29, 24)
++#define MARGINING_NUM_VOLTAGE_STEPS		GENMASK(22, 16)
++#define MARGINING_MAX_TIMING_OFFSET		GENMASK(13, 8)
++#define MARGINING_NUM_TIMING_STEPS		GENMASK(5, 0)
++
++#define GEN4_LANE_MARGINING_2_OFF		0xB84
++#define MARGINING_IND_ERROR_SAMPLER		BIT(28)
++#define MARGINING_SAMPLE_REPORTING_METHOD	BIT(27)
++#define MARGINING_IND_LEFT_RIGHT_TIMING		BIT(26)
++#define MARGINING_IND_UP_DOWN_VOLTAGE		BIT(25)
++#define MARGINING_VOLTAGE_SUPPORTED		BIT(24)
++#define MARGINING_MAXLANES			GENMASK(20, 16)
++#define MARGINING_SAMPLE_RATE_TIMING		GENMASK(13, 8)
++#define MARGINING_SAMPLE_RATE_VOLTAGE		GENMASK(5, 0)
++/*
++ * iATU Unroll-specific register definitions
++ * From 4.80 core version the address translation will be made by unroll
++ */
++#define PCIE_ATU_UNR_REGION_CTRL1	0x00
++#define PCIE_ATU_UNR_REGION_CTRL2	0x04
++#define PCIE_ATU_UNR_LOWER_BASE		0x08
++#define PCIE_ATU_UNR_UPPER_BASE		0x0C
++#define PCIE_ATU_UNR_LOWER_LIMIT	0x10
++#define PCIE_ATU_UNR_LOWER_TARGET	0x14
++#define PCIE_ATU_UNR_UPPER_TARGET	0x18
++#define PCIE_ATU_UNR_UPPER_LIMIT	0x20
++
++/*
++ * RAS-DES register definitions
++ */
++#define PCIE_RAS_DES_EVENT_COUNTER_CONTROL	0x8
++#define EVENT_COUNTER_ALL_CLEAR		0x3
++#define EVENT_COUNTER_ENABLE_ALL	0x7
++#define EVENT_COUNTER_ENABLE_SHIFT	2
++#define EVENT_COUNTER_EVENT_SEL_MASK	GENMASK(7, 0)
++#define EVENT_COUNTER_EVENT_SEL_SHIFT	16
++#define EVENT_COUNTER_EVENT_Tx_L0S	0x2
++#define EVENT_COUNTER_EVENT_Rx_L0S	0x3
++#define EVENT_COUNTER_EVENT_L1		0x5
++#define EVENT_COUNTER_EVENT_L1_1	0x7
++#define EVENT_COUNTER_EVENT_L1_2	0x8
++#define EVENT_COUNTER_GROUP_SEL_SHIFT	24
++#define EVENT_COUNTER_GROUP_5		0x5
++
++#define PCIE_RAS_DES_EVENT_COUNTER_DATA		0xc
++
++/* PTM register definitions */
++#define PTM_RES_REQ_CTRL		0x8
++#define PTM_RES_CCONTEXT_VALID		BIT(0)
++#define PTM_REQ_AUTO_UPDATE_ENABLED	BIT(0)
++#define PTM_REQ_START_UPDATE		BIT(1)
++
++#define PTM_LOCAL_LSB			0x10
++#define PTM_LOCAL_MSB			0x14
++#define PTM_T1_T2_LSB			0x18
++#define PTM_T1_T2_MSB			0x1c
++#define PTM_T3_T4_LSB			0x28
++#define PTM_T3_T4_MSB			0x2c
++#define PTM_MASTER_LSB			0x38
++#define PTM_MASTER_MSB			0x3c
++
++/*
++ * The default address offset between dbi_base and atu_base. Root controller
++ * drivers are not required to initialize atu_base if the offset matches this
++ * default; the driver core automatically derives atu_base from dbi_base using
++ * this offset, if atu_base not set.
++ */
++#define DEFAULT_DBI_ATU_OFFSET (0x3 << 20)
++#define DEFAULT_DBI_DMA_OFFSET PCIE_DMA_UNROLL_BASE
++
++#define MAX_MSI_IRQS			256
++#define MAX_MSI_IRQS_PER_CTRL		32
++#define MAX_MSI_CTRLS			(MAX_MSI_IRQS / MAX_MSI_IRQS_PER_CTRL)
++#define MSI_REG_CTRL_BLOCK_SIZE		12
++#define MSI_DEF_NUM_VECTORS		32
++
++/* Maximum number of inbound/outbound iATUs */
++#define MAX_IATU_IN			256
++#define MAX_IATU_OUT			256
++
++/* Default eDMA LLP memory size */
++#define DMA_LLP_MEM_SIZE		PAGE_SIZE
++
++/* Common struct pci_epc_feature bits among DWC EP glue drivers */
++#define DWC_EPC_COMMON_FEATURES		.dynamic_inbound_mapping = true, \
++					.subrange_mapping = true
++
++struct dw_pcie;
++struct dw_pcie_rp;
++struct dw_pcie_ep;
++
++enum dw_pcie_device_mode {
++	DW_PCIE_UNKNOWN_TYPE,
++	DW_PCIE_EP_TYPE,
++	DW_PCIE_LEG_EP_TYPE,
++	DW_PCIE_RC_TYPE,
++};
++
++enum dw_pcie_app_clk {
++	DW_PCIE_DBI_CLK,
++	DW_PCIE_MSTR_CLK,
++	DW_PCIE_SLV_CLK,
++	DW_PCIE_NUM_APP_CLKS
++};
++
++enum dw_pcie_core_clk {
++	DW_PCIE_PIPE_CLK,
++	DW_PCIE_CORE_CLK,
++	DW_PCIE_AUX_CLK,
++	DW_PCIE_REF_CLK,
++	DW_PCIE_NUM_CORE_CLKS
++};
++
++enum dw_pcie_app_rst {
++	DW_PCIE_DBI_RST,
++	DW_PCIE_MSTR_RST,
++	DW_PCIE_SLV_RST,
++	DW_PCIE_NUM_APP_RSTS
++};
++
++enum dw_pcie_core_rst {
++	DW_PCIE_NON_STICKY_RST,
++	DW_PCIE_STICKY_RST,
++	DW_PCIE_CORE_RST,
++	DW_PCIE_PIPE_RST,
++	DW_PCIE_PHY_RST,
++	DW_PCIE_HOT_RST,
++	DW_PCIE_PWR_RST,
++	DW_PCIE_NUM_CORE_RSTS
++};
++
++enum dw_pcie_ltssm {
++	/* Need to align with PCIE_PORT_DEBUG0 bits 0:5 */
++	DW_PCIE_LTSSM_DETECT_QUIET = 0x0,
++	DW_PCIE_LTSSM_DETECT_ACT = 0x1,
++	DW_PCIE_LTSSM_POLL_ACTIVE = 0x2,
++	DW_PCIE_LTSSM_POLL_COMPLIANCE = 0x3,
++	DW_PCIE_LTSSM_POLL_CONFIG = 0x4,
++	DW_PCIE_LTSSM_PRE_DETECT_QUIET = 0x5,
++	DW_PCIE_LTSSM_DETECT_WAIT = 0x6,
++	DW_PCIE_LTSSM_CFG_LINKWD_START = 0x7,
++	DW_PCIE_LTSSM_CFG_LINKWD_ACEPT = 0x8,
++	DW_PCIE_LTSSM_CFG_LANENUM_WAI = 0x9,
++	DW_PCIE_LTSSM_CFG_LANENUM_ACEPT = 0xa,
++	DW_PCIE_LTSSM_CFG_COMPLETE = 0xb,
++	DW_PCIE_LTSSM_CFG_IDLE = 0xc,
++	DW_PCIE_LTSSM_RCVRY_LOCK = 0xd,
++	DW_PCIE_LTSSM_RCVRY_SPEED = 0xe,
++	DW_PCIE_LTSSM_RCVRY_RCVRCFG = 0xf,
++	DW_PCIE_LTSSM_RCVRY_IDLE = 0x10,
++	DW_PCIE_LTSSM_L0 = 0x11,
++	DW_PCIE_LTSSM_L0S = 0x12,
++	DW_PCIE_LTSSM_L123_SEND_EIDLE = 0x13,
++	DW_PCIE_LTSSM_L1_IDLE = 0x14,
++	DW_PCIE_LTSSM_L2_IDLE = 0x15,
++	DW_PCIE_LTSSM_L2_WAKE = 0x16,
++	DW_PCIE_LTSSM_DISABLED_ENTRY = 0x17,
++	DW_PCIE_LTSSM_DISABLED_IDLE = 0x18,
++	DW_PCIE_LTSSM_DISABLED = 0x19,
++	DW_PCIE_LTSSM_LPBK_ENTRY = 0x1a,
++	DW_PCIE_LTSSM_LPBK_ACTIVE = 0x1b,
++	DW_PCIE_LTSSM_LPBK_EXIT = 0x1c,
++	DW_PCIE_LTSSM_LPBK_EXIT_TIMEOUT = 0x1d,
++	DW_PCIE_LTSSM_HOT_RESET_ENTRY = 0x1e,
++	DW_PCIE_LTSSM_HOT_RESET = 0x1f,
++	DW_PCIE_LTSSM_RCVRY_EQ0 = 0x20,
++	DW_PCIE_LTSSM_RCVRY_EQ1 = 0x21,
++	DW_PCIE_LTSSM_RCVRY_EQ2 = 0x22,
++	DW_PCIE_LTSSM_RCVRY_EQ3 = 0x23,
++
++	/* Vendor glue drivers provide pseudo L1 substates from get_ltssm() */
++	DW_PCIE_LTSSM_L1_1 = 0x141,
++	DW_PCIE_LTSSM_L1_2 = 0x142,
++
++	DW_PCIE_LTSSM_UNKNOWN = 0xFFFFFFFF,
++};
++
++struct dw_pcie_ob_atu_cfg {
++	int index;
++	int type;
++	u8 func_no;
++	u8 code;
++	u8 routing;
++	u32 ctrl2;
++	u64 parent_bus_addr;
++	u64 pci_addr;
++	u64 size;
++};
++
++struct dw_pcie_host_ops {
++	int (*init)(struct dw_pcie_rp *pp);
++	void (*deinit)(struct dw_pcie_rp *pp);
++	void (*post_init)(struct dw_pcie_rp *pp);
++	int (*msi_init)(struct dw_pcie_rp *pp);
++	void (*pme_turn_off)(struct dw_pcie_rp *pp);
++};
++
++struct dw_pcie_rp {
++	bool			use_imsi_rx:1;
++	bool			keep_rp_msi_en:1;
++	bool			cfg0_io_shared:1;
++	u64			cfg0_base;
++	void __iomem		*va_cfg0_base;
++	u32			cfg0_size;
++	resource_size_t		io_base;
++	phys_addr_t		io_bus_addr;
++	u32			io_size;
++	int			irq;
++	const struct dw_pcie_host_ops *ops;
++	int			msi_irq[MAX_MSI_CTRLS];
++	struct irq_domain	*irq_domain;
++	dma_addr_t		msi_data;
++	struct irq_chip		*msi_irq_chip;
++	u32			num_vectors;
++	u32			irq_mask[MAX_MSI_CTRLS];
++	struct pci_host_bridge  *bridge;
++	raw_spinlock_t		lock;
++	DECLARE_BITMAP(msi_irq_in_use, MAX_MSI_IRQS);
++	bool			use_atu_msg;
++	int			msg_atu_index;
++	struct resource		*msg_res;
++	struct pci_eq_presets	presets;
++	struct pci_config_window *cfg;
++	bool			ecam_enabled;
++	bool			native_ecam;
++	bool                    skip_l23_ready;
++	bool			skip_pwrctrl_off;
++};
++
++struct dw_pcie_ep_ops {
++	void	(*pre_init)(struct dw_pcie_ep *ep);
++	void	(*init)(struct dw_pcie_ep *ep);
++	int	(*raise_irq)(struct dw_pcie_ep *ep, u8 func_no,
++			     unsigned int type, u16 interrupt_num);
++	const struct pci_epc_features* (*get_features)(struct dw_pcie_ep *ep);
++	/*
++	 * Provide a method to implement the different func config space
++	 * access for different platform, if different func have different
++	 * offset, return the offset of func. if use write a register way
++	 * return a 0, and implement code in callback function of platform
++	 * driver.
++	 */
++	unsigned int (*get_dbi_offset)(struct dw_pcie_ep *ep, u8 func_no);
++	unsigned int (*get_dbi2_offset)(struct dw_pcie_ep *ep, u8 func_no);
++};
++
++struct dw_pcie_ep_func {
++	struct list_head	list;
++	u8			func_no;
++	u8			msi_cap;	/* MSI capability offset */
++	u8			msix_cap;	/* MSI-X capability offset */
++	u8			bar_to_atu[PCI_STD_NUM_BARS];
++	struct pci_epf_bar	*epf_bar[PCI_STD_NUM_BARS];
++
++	/* Only for Address Match Mode inbound iATU */
++	u32			*ib_atu_indexes[PCI_STD_NUM_BARS];
++	unsigned int		num_ib_atu_indexes[PCI_STD_NUM_BARS];
++};
++
++struct dw_pcie_ep {
++	struct pci_epc		*epc;
++	struct list_head	func_list;
++	const struct dw_pcie_ep_ops *ops;
++	phys_addr_t		phys_base;
++	size_t			addr_size;
++	size_t			page_size;
++	phys_addr_t		*outbound_addr;
++	unsigned long		*ib_window_map;
++	unsigned long		*ob_window_map;
++	void __iomem		*msi_mem;
++	phys_addr_t		msi_mem_phys;
++
++	/* MSI outbound iATU state */
++	bool			msi_iatu_mapped;
++	u64			msi_msg_addr;
++	size_t			msi_map_size;
++};
++
++struct dw_pcie_ops {
++	u64	(*cpu_addr_fixup)(struct dw_pcie *pcie, u64 cpu_addr);
++	u32	(*read_dbi)(struct dw_pcie *pcie, void __iomem *base, u32 reg,
++			    size_t size);
++	void	(*write_dbi)(struct dw_pcie *pcie, void __iomem *base, u32 reg,
++			     size_t size, u32 val);
++	void    (*write_dbi2)(struct dw_pcie *pcie, void __iomem *base, u32 reg,
++			      size_t size, u32 val);
++	bool	(*link_up)(struct dw_pcie *pcie);
++	enum dw_pcie_ltssm (*get_ltssm)(struct dw_pcie *pcie);
++	int	(*start_link)(struct dw_pcie *pcie);
++	void	(*stop_link)(struct dw_pcie *pcie);
++};
++
++struct debugfs_info {
++	struct dentry		*debug_dir;
++	void			*rasdes_info;
++};
++
++struct dw_pcie {
++	struct device		*dev;
++	void __iomem		*dbi_base;
++	resource_size_t		dbi_phys_addr;
++	void __iomem		*dbi_base2;
++	void __iomem		*atu_base;
++	void __iomem		*elbi_base;
++	resource_size_t		atu_phys_addr;
++	size_t			atu_size;
++	resource_size_t		parent_bus_offset;
++	u32			num_ib_windows;
++	u32			num_ob_windows;
++	u32			region_align;
++	u64			region_limit;
++	struct dw_pcie_rp	pp;
++	struct dw_pcie_ep	ep;
++	const struct dw_pcie_ops *ops;
++	u32			version;
++	u32			type;
++	unsigned long		caps;
++	int			num_lanes;
++	int			max_link_speed;
++	u8			n_fts[2];
++	struct dw_edma_chip	edma;
++	phys_addr_t		edma_reg_phys;
++	resource_size_t		edma_reg_size;
++	bool			l1ss_support;	/* L1 PM Substates support */
++	struct clk_bulk_data	app_clks[DW_PCIE_NUM_APP_CLKS];
++	struct clk_bulk_data	core_clks[DW_PCIE_NUM_CORE_CLKS];
++	struct reset_control_bulk_data	app_rsts[DW_PCIE_NUM_APP_RSTS];
++	struct reset_control_bulk_data	core_rsts[DW_PCIE_NUM_CORE_RSTS];
++	struct gpio_desc		*pe_rst;
++	bool			suspended;
++	struct debugfs_info	*debugfs;
++	enum			dw_pcie_device_mode mode;
++	u16			ptm_vsec_offset;
++	struct pci_ptm_debugfs	*ptm_debugfs;
++
++	/*
++	 * If iATU input addresses are offset from CPU physical addresses,
++	 * we previously required .cpu_addr_fixup() to convert them.  We
++	 * now rely on the devicetree instead.  If .cpu_addr_fixup()
++	 * exists, we compare its results with devicetree.
++	 *
++	 * If .cpu_addr_fixup() does not exist, we assume the offset is
++	 * zero and warn if devicetree claims otherwise.  If we know all
++	 * devicetrees correctly describe the offset, set
++	 * use_parent_dt_ranges to true to avoid this warning.
++	 */
++	bool			use_parent_dt_ranges;
++};
++
++#define to_dw_pcie_from_pp(port) container_of((port), struct dw_pcie, pp)
++
++#define to_dw_pcie_from_ep(endpoint)   \
++		container_of((endpoint), struct dw_pcie, ep)
++
++int dw_pcie_get_resources(struct dw_pcie *pci);
++
++void dw_pcie_version_detect(struct dw_pcie *pci);
++
++u8 dw_pcie_find_capability(struct dw_pcie *pci, u8 cap);
++u16 dw_pcie_find_ext_capability(struct dw_pcie *pci, u8 cap);
++void dw_pcie_remove_capability(struct dw_pcie *pci, u8 cap);
++void dw_pcie_remove_ext_capability(struct dw_pcie *pci, u8 cap);
++u16 dw_pcie_find_rasdes_capability(struct dw_pcie *pci);
++u16 dw_pcie_find_ptm_capability(struct dw_pcie *pci);
++
++int dw_pcie_read(void __iomem *addr, int size, u32 *val);
++int dw_pcie_write(void __iomem *addr, int size, u32 val);
++
++u32 dw_pcie_read_dbi(struct dw_pcie *pci, u32 reg, size_t size);
++void dw_pcie_write_dbi(struct dw_pcie *pci, u32 reg, size_t size, u32 val);
++void dw_pcie_write_dbi2(struct dw_pcie *pci, u32 reg, size_t size, u32 val);
++bool dw_pcie_link_up(struct dw_pcie *pci);
++void dw_pcie_upconfig_setup(struct dw_pcie *pci);
++int dw_pcie_wait_for_link(struct dw_pcie *pci);
++int dw_pcie_link_get_max_link_width(struct dw_pcie *pci);
++int dw_pcie_prog_outbound_atu(struct dw_pcie *pci,
++			      const struct dw_pcie_ob_atu_cfg *atu);
++int dw_pcie_prog_inbound_atu(struct dw_pcie *pci, int index, int type,
++			     u64 parent_bus_addr, u64 pci_addr, u64 size);
++int dw_pcie_prog_ep_inbound_atu(struct dw_pcie *pci, u8 func_no, int index,
++				int type, u64 parent_bus_addr,
++				u8 bar, size_t size);
++void dw_pcie_disable_atu(struct dw_pcie *pci, u32 dir, int index);
++void dw_pcie_hide_unsupported_l1ss(struct dw_pcie *pci);
++void dw_pcie_program_t_power_on(struct dw_pcie *pci, u32 t_power_on);
++void dw_pcie_setup(struct dw_pcie *pci);
++void dw_pcie_iatu_detect(struct dw_pcie *pci);
++int dw_pcie_edma_detect(struct dw_pcie *pci);
++void dw_pcie_edma_remove(struct dw_pcie *pci);
++resource_size_t dw_pcie_parent_bus_offset(struct dw_pcie *pci,
++					  const char *reg_name,
++					  resource_size_t cpu_phy_addr);
++
++static inline void dw_pcie_writel_dbi(struct dw_pcie *pci, u32 reg, u32 val)
++{
++	dw_pcie_write_dbi(pci, reg, 0x4, val);
++}
++
++static inline u32 dw_pcie_readl_dbi(struct dw_pcie *pci, u32 reg)
++{
++	return dw_pcie_read_dbi(pci, reg, 0x4);
++}
++
++static inline void dw_pcie_writew_dbi(struct dw_pcie *pci, u32 reg, u16 val)
++{
++	dw_pcie_write_dbi(pci, reg, 0x2, val);
++}
++
++static inline u16 dw_pcie_readw_dbi(struct dw_pcie *pci, u32 reg)
++{
++	return dw_pcie_read_dbi(pci, reg, 0x2);
++}
++
++static inline void dw_pcie_writeb_dbi(struct dw_pcie *pci, u32 reg, u8 val)
++{
++	dw_pcie_write_dbi(pci, reg, 0x1, val);
++}
++
++static inline u8 dw_pcie_readb_dbi(struct dw_pcie *pci, u32 reg)
++{
++	return dw_pcie_read_dbi(pci, reg, 0x1);
++}
++
++static inline void dw_pcie_writel_dbi2(struct dw_pcie *pci, u32 reg, u32 val)
++{
++	dw_pcie_write_dbi2(pci, reg, 0x4, val);
++}
++
++static inline int dw_pcie_read_cfg_byte(struct dw_pcie *pci, int where,
++					u8 *val)
++{
++	*val = dw_pcie_readb_dbi(pci, where);
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static inline int dw_pcie_read_cfg_word(struct dw_pcie *pci, int where,
++					u16 *val)
++{
++	*val = dw_pcie_readw_dbi(pci, where);
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static inline int dw_pcie_read_cfg_dword(struct dw_pcie *pci, int where,
++					 u32 *val)
++{
++	*val = dw_pcie_readl_dbi(pci, where);
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static inline unsigned int dw_pcie_ep_get_dbi_offset(struct dw_pcie_ep *ep,
++						     u8 func_no)
++{
++	unsigned int dbi_offset = 0;
++
++	if (ep->ops->get_dbi_offset)
++		dbi_offset = ep->ops->get_dbi_offset(ep, func_no);
++
++	return dbi_offset;
++}
++
++static inline u32 dw_pcie_ep_read_dbi(struct dw_pcie_ep *ep, u8 func_no,
++				      u32 reg, size_t size)
++{
++	unsigned int offset = dw_pcie_ep_get_dbi_offset(ep, func_no);
++	struct dw_pcie *pci = to_dw_pcie_from_ep(ep);
++
++	return dw_pcie_read_dbi(pci, offset + reg, size);
++}
++
++static inline void dw_pcie_ep_write_dbi(struct dw_pcie_ep *ep, u8 func_no,
++					u32 reg, size_t size, u32 val)
++{
++	unsigned int offset = dw_pcie_ep_get_dbi_offset(ep, func_no);
++	struct dw_pcie *pci = to_dw_pcie_from_ep(ep);
++
++	dw_pcie_write_dbi(pci, offset + reg, size, val);
++}
++
++static inline void dw_pcie_ep_writel_dbi(struct dw_pcie_ep *ep, u8 func_no,
++					 u32 reg, u32 val)
++{
++	dw_pcie_ep_write_dbi(ep, func_no, reg, 0x4, val);
++}
++
++static inline u32 dw_pcie_ep_readl_dbi(struct dw_pcie_ep *ep, u8 func_no,
++				       u32 reg)
++{
++	return dw_pcie_ep_read_dbi(ep, func_no, reg, 0x4);
++}
++
++static inline void dw_pcie_ep_writew_dbi(struct dw_pcie_ep *ep, u8 func_no,
++					 u32 reg, u16 val)
++{
++	dw_pcie_ep_write_dbi(ep, func_no, reg, 0x2, val);
++}
++
++static inline u16 dw_pcie_ep_readw_dbi(struct dw_pcie_ep *ep, u8 func_no,
++				       u32 reg)
++{
++	return dw_pcie_ep_read_dbi(ep, func_no, reg, 0x2);
++}
++
++static inline void dw_pcie_ep_writeb_dbi(struct dw_pcie_ep *ep, u8 func_no,
++					 u32 reg, u8 val)
++{
++	dw_pcie_ep_write_dbi(ep, func_no, reg, 0x1, val);
++}
++
++static inline u8 dw_pcie_ep_readb_dbi(struct dw_pcie_ep *ep, u8 func_no,
++				      u32 reg)
++{
++	return dw_pcie_ep_read_dbi(ep, func_no, reg, 0x1);
++}
++
++static inline int dw_pcie_ep_read_cfg_byte(struct dw_pcie_ep *ep, u8 func_no,
++					   int where, u8 *val)
++{
++	*val = dw_pcie_ep_readb_dbi(ep, func_no, where);
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static inline int dw_pcie_ep_read_cfg_word(struct dw_pcie_ep *ep, u8 func_no,
++					   int where, u16 *val)
++{
++	*val = dw_pcie_ep_readw_dbi(ep, func_no, where);
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static inline int dw_pcie_ep_read_cfg_dword(struct dw_pcie_ep *ep, u8 func_no,
++					    int where, u32 *val)
++{
++	*val = dw_pcie_ep_readl_dbi(ep, func_no, where);
++	return PCIBIOS_SUCCESSFUL;
++}
++
++static inline unsigned int dw_pcie_ep_get_dbi2_offset(struct dw_pcie_ep *ep,
++						      u8 func_no)
++{
++	unsigned int dbi2_offset = 0;
++
++	if (ep->ops->get_dbi2_offset)
++		dbi2_offset = ep->ops->get_dbi2_offset(ep, func_no);
++	else if (ep->ops->get_dbi_offset)     /* for backward compatibility */
++		dbi2_offset = ep->ops->get_dbi_offset(ep, func_no);
++
++	return dbi2_offset;
++}
++
++static inline void dw_pcie_ep_write_dbi2(struct dw_pcie_ep *ep, u8 func_no,
++					 u32 reg, size_t size, u32 val)
++{
++	unsigned int offset = dw_pcie_ep_get_dbi2_offset(ep, func_no);
++	struct dw_pcie *pci = to_dw_pcie_from_ep(ep);
++
++	dw_pcie_write_dbi2(pci, offset + reg, size, val);
++}
++
++static inline void dw_pcie_ep_writel_dbi2(struct dw_pcie_ep *ep, u8 func_no,
++					  u32 reg, u32 val)
++{
++	dw_pcie_ep_write_dbi2(ep, func_no, reg, 0x4, val);
++}
++
++static inline void dw_pcie_dbi_ro_wr_en(struct dw_pcie *pci)
++{
++	u32 reg;
++	u32 val;
++
++	reg = PCIE_MISC_CONTROL_1_OFF;
++	val = dw_pcie_readl_dbi(pci, reg);
++	val |= PCIE_DBI_RO_WR_EN;
++	dw_pcie_writel_dbi(pci, reg, val);
++}
++
++static inline void dw_pcie_dbi_ro_wr_dis(struct dw_pcie *pci)
++{
++	u32 reg;
++	u32 val;
++
++	reg = PCIE_MISC_CONTROL_1_OFF;
++	val = dw_pcie_readl_dbi(pci, reg);
++	val &= ~PCIE_DBI_RO_WR_EN;
++	dw_pcie_writel_dbi(pci, reg, val);
++}
++
++static inline int dw_pcie_start_link(struct dw_pcie *pci)
++{
++	if (pci->ops && pci->ops->start_link)
++		return pci->ops->start_link(pci);
++
++	return 0;
++}
++
++static inline void dw_pcie_stop_link(struct dw_pcie *pci)
++{
++	if (pci->ops && pci->ops->stop_link)
++		pci->ops->stop_link(pci);
++}
++
++static inline enum dw_pcie_ltssm dw_pcie_get_ltssm(struct dw_pcie *pci)
++{
++	u32 val;
++
++	if (pci->ops && pci->ops->get_ltssm)
++		return pci->ops->get_ltssm(pci);
++
++	val = dw_pcie_readl_dbi(pci, PCIE_PORT_DEBUG0);
++
++	return (enum dw_pcie_ltssm)FIELD_GET(PORT_LOGIC_LTSSM_STATE_MASK, val);
++}
++
++const char *dw_pcie_ltssm_status_string(enum dw_pcie_ltssm ltssm);
++
++#ifdef CONFIG_PCIE_DW_HOST
++int dw_pcie_suspend_noirq(struct dw_pcie *pci);
++int dw_pcie_resume_noirq(struct dw_pcie *pci);
++void dw_handle_msi_irq(struct dw_pcie_rp *pp);
++void dw_pcie_msi_init(struct dw_pcie_rp *pp);
++int dw_pcie_msi_host_init(struct dw_pcie_rp *pp);
++void dw_pcie_free_msi(struct dw_pcie_rp *pp);
++int dw_pcie_setup_rc(struct dw_pcie_rp *pp);
++int dw_pcie_host_init(struct dw_pcie_rp *pp);
++void dw_pcie_host_deinit(struct dw_pcie_rp *pp);
++int dw_pcie_allocate_domains(struct dw_pcie_rp *pp);
++void __iomem *dw_pcie_own_conf_map_bus(struct pci_bus *bus, unsigned int devfn,
++				       int where);
++#else
++static inline int dw_pcie_suspend_noirq(struct dw_pcie *pci)
++{
++	return 0;
++}
++
++static inline int dw_pcie_resume_noirq(struct dw_pcie *pci)
++{
++	return 0;
++}
++
++static inline void dw_handle_msi_irq(struct dw_pcie_rp *pp) { }
++
++static inline void dw_pcie_msi_init(struct dw_pcie_rp *pp)
++{ }
++
++static inline int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
++{
++	return -ENODEV;
++}
++
++static inline void dw_pcie_free_msi(struct dw_pcie_rp *pp)
++{ }
++
++static inline int dw_pcie_setup_rc(struct dw_pcie_rp *pp)
++{
++	return 0;
++}
++
++static inline int dw_pcie_host_init(struct dw_pcie_rp *pp)
++{
++	return 0;
++}
++
++static inline void dw_pcie_host_deinit(struct dw_pcie_rp *pp)
++{
++}
++
++static inline int dw_pcie_allocate_domains(struct dw_pcie_rp *pp)
++{
++	return 0;
++}
++static inline void __iomem *dw_pcie_own_conf_map_bus(struct pci_bus *bus,
++						     unsigned int devfn,
++						     int where)
++{
++	return NULL;
++}
++#endif
++
++#ifdef CONFIG_PCIE_DW_EP
++void dw_pcie_ep_linkup(struct dw_pcie_ep *ep);
++void dw_pcie_ep_linkdown(struct dw_pcie_ep *ep);
++int dw_pcie_ep_init(struct dw_pcie_ep *ep);
++int dw_pcie_ep_init_registers(struct dw_pcie_ep *ep);
++void dw_pcie_ep_deinit(struct dw_pcie_ep *ep);
++void dw_pcie_ep_cleanup(struct dw_pcie_ep *ep);
++int dw_pcie_ep_raise_intx_irq(struct dw_pcie_ep *ep, u8 func_no);
++int dw_pcie_ep_raise_msi_irq(struct dw_pcie_ep *ep, u8 func_no,
++			     u8 interrupt_num);
++int dw_pcie_ep_raise_msix_irq(struct dw_pcie_ep *ep, u8 func_no,
++			     u16 interrupt_num);
++int dw_pcie_ep_raise_msix_irq_doorbell(struct dw_pcie_ep *ep, u8 func_no,
++				       u16 interrupt_num);
++void dw_pcie_ep_reset_bar(struct dw_pcie *pci, enum pci_barno bar);
++struct dw_pcie_ep_func *
++dw_pcie_ep_get_func_from_ep(struct dw_pcie_ep *ep, u8 func_no);
++#else
++static inline void dw_pcie_ep_linkup(struct dw_pcie_ep *ep)
++{
++}
++
++static inline void dw_pcie_ep_linkdown(struct dw_pcie_ep *ep)
++{
++}
++
++static inline int dw_pcie_ep_init(struct dw_pcie_ep *ep)
++{
++	return 0;
++}
++
++static inline int dw_pcie_ep_init_registers(struct dw_pcie_ep *ep)
++{
++	return 0;
++}
++
++static inline void dw_pcie_ep_deinit(struct dw_pcie_ep *ep)
++{
++}
++
++static inline void dw_pcie_ep_cleanup(struct dw_pcie_ep *ep)
++{
++}
++
++static inline int dw_pcie_ep_raise_intx_irq(struct dw_pcie_ep *ep, u8 func_no)
++{
++	return 0;
++}
++
++static inline int dw_pcie_ep_raise_msi_irq(struct dw_pcie_ep *ep, u8 func_no,
++					   u8 interrupt_num)
++{
++	return 0;
++}
++
++static inline int dw_pcie_ep_raise_msix_irq(struct dw_pcie_ep *ep, u8 func_no,
++					   u16 interrupt_num)
++{
++	return 0;
++}
++
++static inline int dw_pcie_ep_raise_msix_irq_doorbell(struct dw_pcie_ep *ep,
++						     u8 func_no,
++						     u16 interrupt_num)
++{
++	return 0;
++}
++
++static inline void dw_pcie_ep_reset_bar(struct dw_pcie *pci, enum pci_barno bar)
++{
++}
++
++static inline struct dw_pcie_ep_func *
++dw_pcie_ep_get_func_from_ep(struct dw_pcie_ep *ep, u8 func_no)
++{
++	return NULL;
++}
++#endif
++
++#ifdef CONFIG_PCIE_DW_DEBUGFS
++void dwc_pcie_debugfs_init(struct dw_pcie *pci, enum dw_pcie_device_mode mode);
++void dwc_pcie_debugfs_deinit(struct dw_pcie *pci);
++#else
++static inline void dwc_pcie_debugfs_init(struct dw_pcie *pci,
++					 enum dw_pcie_device_mode mode)
++{
++}
++static inline void dwc_pcie_debugfs_deinit(struct dw_pcie *pci)
++{
++}
++#endif
++
++#endif /* _PCIE_DESIGNWARE_H */
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index d8eb528..a5d89e1 100644
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -71,7 +71,6 @@
+ 
+ /* ELBI registers */
+ #define ELBI_SYS_CTRL				0x04
+-#define ELBI_SYS_STTS				0x08
+ 
+ /* DBI registers */
+ #define AXI_MSTR_RESP_COMP_CTRL0		0x818
+@@ -132,7 +131,6 @@
+ 
+ /* PARF_LTSSM register fields */
+ #define LTSSM_EN				BIT(8)
+-#define PARF_LTSSM_STATE_MASK			GENMASK(5, 0)
+ 
+ /* PARF_NO_SNOOP_OVERRIDE register fields */
+ #define WR_NO_SNOOP_OVERRIDE_EN			BIT(1)
+@@ -146,10 +144,6 @@
+ 
+ /* ELBI_SYS_CTRL register fields */
+ #define ELBI_SYS_CTRL_LT_ENABLE			BIT(0)
+-#define ELBI_SYS_CTRL_PME_TURNOFF_MSG		BIT(4)
+-
+-/* ELBI_SYS_STTS register fields */
+-#define ELBI_SYS_STTS_LTSSM_STATE_MASK		GENMASK(17, 12)
+ 
+ /* AXI_MSTR_RESP_COMP_CTRL0 register fields */
+ #define CFG_REMOTE_RD_REQ_BRIDGE_SIZE_2K	0x4
+@@ -251,7 +245,6 @@ struct qcom_pcie_ops {
+ 	void (*deinit)(struct qcom_pcie *pcie);
+ 	void (*ltssm_enable)(struct qcom_pcie *pcie);
+ 	int (*config_sid)(struct qcom_pcie *pcie);
+-	enum dw_pcie_ltssm (*get_ltssm)(struct qcom_pcie *pcie);
+ };
+ 
+  /**
+@@ -436,15 +429,6 @@ static void qcom_pcie_2_1_0_ltssm_enable(struct qcom_pcie *pcie)
+ 	writel(val, pci->elbi_base + ELBI_SYS_CTRL);
+ }
+ 
+-static enum dw_pcie_ltssm qcom_pcie_2_1_0_get_ltssm(struct qcom_pcie *pcie)
+-{
+-	struct dw_pcie *pci = pcie->pci;
+-	u32 val;
+-
+-	val = readl(pci->elbi_base + ELBI_SYS_STTS);
+-	return (enum dw_pcie_ltssm)FIELD_GET(ELBI_SYS_STTS_LTSSM_STATE_MASK, val);
+-}
+-
+ static int qcom_pcie_get_resources_2_1_0(struct qcom_pcie *pcie)
+ {
+ 	struct qcom_pcie_resources_2_1_0 *res = &pcie->res.v2_1_0;
+@@ -534,7 +518,7 @@ static int qcom_pcie_post_init_2_1_0(struct qcom_pcie *pcie)
+ 	u32 val;
+ 	int ret;
+ 
+-	/* Force PHY out of lowest power state */
++	/* enable PCIe clocks and resets */
+ 	val = readl(pcie->parf + PARF_PHY_CTRL);
+ 	val &= ~PHY_TEST_PWR_DOWN;
+ 	writel(val, pcie->parf + PARF_PHY_CTRL);
+@@ -701,12 +685,6 @@ static int qcom_pcie_get_resources_2_3_2(struct qcom_pcie *pcie)
+ static void qcom_pcie_deinit_2_3_2(struct qcom_pcie *pcie)
+ {
+ 	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
+-	u32 val;
+-
+-	/* Force PHY to lowest power state*/
+-	val = readl(pcie->parf + PARF_PHY_CTRL);
+-	val |= PHY_TEST_PWR_DOWN;
+-	writel(val, pcie->parf + PARF_PHY_CTRL);
+ 
+ 	clk_bulk_disable_unprepare(res->num_clks, res->clks);
+ 	regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
+@@ -739,7 +717,7 @@ static int qcom_pcie_post_init_2_3_2(struct qcom_pcie *pcie)
+ {
+ 	u32 val;
+ 
+-	/* Force PHY out of lowest power state */
++	/* enable PCIe clocks and resets */
+ 	val = readl(pcie->parf + PARF_PHY_CTRL);
+ 	val &= ~PHY_TEST_PWR_DOWN;
+ 	writel(val, pcie->parf + PARF_PHY_CTRL);
+@@ -803,12 +781,6 @@ static int qcom_pcie_get_resources_2_4_0(struct qcom_pcie *pcie)
+ static void qcom_pcie_deinit_2_4_0(struct qcom_pcie *pcie)
+ {
+ 	struct qcom_pcie_resources_2_4_0 *res = &pcie->res.v2_4_0;
+-	u32 val;
+-
+-	/* Force PHY to lowest power state*/
+-	val = readl(pcie->parf + PARF_PHY_CTRL);
+-	val |= PHY_TEST_PWR_DOWN;
+-	writel(val, pcie->parf + PARF_PHY_CTRL);
+ 
+ 	reset_control_bulk_assert(res->num_resets, res->resets);
+ 	clk_bulk_disable_unprepare(res->num_clks, res->clks);
+@@ -877,12 +849,6 @@ static int qcom_pcie_get_resources_2_3_3(struct qcom_pcie *pcie)
+ static void qcom_pcie_deinit_2_3_3(struct qcom_pcie *pcie)
+ {
+ 	struct qcom_pcie_resources_2_3_3 *res = &pcie->res.v2_3_3;
+-	u32 val;
+-
+-	/* Force PHY to lowest power state */
+-	val = readl(pcie->parf + PARF_PHY_CTRL);
+-	val |= PHY_TEST_PWR_DOWN;
+-	writel(val, pcie->parf + PARF_PHY_CTRL);
+ 
+ 	clk_bulk_disable_unprepare(res->num_clks, res->clks);
+ }
+@@ -938,7 +904,6 @@ static int qcom_pcie_post_init_2_3_3(struct qcom_pcie *pcie)
+ 	u16 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
+ 	u32 val;
+ 
+-	/* Force PHY out of lowest power state */
+ 	val = readl(pcie->parf + PARF_PHY_CTRL);
+ 	val &= ~PHY_TEST_PWR_DOWN;
+ 	writel(val, pcie->parf + PARF_PHY_CTRL);
+@@ -1034,7 +999,7 @@ static int qcom_pcie_init_2_7_0(struct qcom_pcie *pcie)
+ 	/* configure PCIe to RC mode */
+ 	writel(DEVICE_TYPE_RC, pcie->parf + PARF_DEVICE_TYPE);
+ 
+-	/* Force PHY out of lowest power state */
++	/* enable PCIe clocks and resets */
+ 	val = readl(pcie->parf + PARF_PHY_CTRL);
+ 	val &= ~PHY_TEST_PWR_DOWN;
+ 	writel(val, pcie->parf + PARF_PHY_CTRL);
+@@ -1105,12 +1070,6 @@ static void qcom_pcie_host_post_init_2_7_0(struct qcom_pcie *pcie)
+ static void qcom_pcie_deinit_2_7_0(struct qcom_pcie *pcie)
+ {
+ 	struct qcom_pcie_resources_2_7_0 *res = &pcie->res.v2_7_0;
+-	u32 val;
+-
+-	/* Force PHY to lowest power state */
+-	val = readl(pcie->parf + PARF_PHY_CTRL);
+-	val |= PHY_TEST_PWR_DOWN;
+-	writel(val, pcie->parf + PARF_PHY_CTRL);
+ 
+ 	clk_bulk_disable_unprepare(res->num_clks, res->clks);
+ 
+@@ -1215,12 +1174,6 @@ static int qcom_pcie_get_resources_2_9_0(struct qcom_pcie *pcie)
+ static void qcom_pcie_deinit_2_9_0(struct qcom_pcie *pcie)
+ {
+ 	struct qcom_pcie_resources_2_9_0 *res = &pcie->res.v2_9_0;
+-	u32 val;
+-
+-	/* Force PHY to lowest power state */
+-	val = readl(pcie->parf + PARF_PHY_CTRL);
+-	val |= PHY_TEST_PWR_DOWN;
+-	writel(val, pcie->parf + PARF_PHY_CTRL);
+ 
+ 	clk_bulk_disable_unprepare(res->num_clks, res->clks);
+ }
+@@ -1261,7 +1214,6 @@ static int qcom_pcie_post_init_2_9_0(struct qcom_pcie *pcie)
+ 	u32 val;
+ 	int i;
+ 
+-	/* Force PHY out of lowest power state */
+ 	val = readl(pcie->parf + PARF_PHY_CTRL);
+ 	val &= ~PHY_TEST_PWR_DOWN;
+ 	writel(val, pcie->parf + PARF_PHY_CTRL);
+@@ -1309,19 +1261,6 @@ static bool qcom_pcie_link_up(struct dw_pcie *pci)
+ 	return val & PCI_EXP_LNKSTA_DLLLA;
+ }
+ 
+-static enum dw_pcie_ltssm qcom_pcie_get_ltssm(struct dw_pcie *pci)
+-{
+-	struct qcom_pcie *pcie = to_qcom_pcie(pci);
+-	u32 val;
+-
+-	if (pcie->cfg->ops->get_ltssm)
+-		return pcie->cfg->ops->get_ltssm(pcie);
+-
+-	val = readl(pcie->parf + PARF_LTSSM);
+-
+-	return (enum dw_pcie_ltssm)FIELD_GET(PARF_LTSSM_STATE_MASK, val);
+-}
+-
+ static void qcom_pcie_phy_power_off(struct qcom_pcie *pcie)
+ {
+ 	struct qcom_pcie_port *port;
+@@ -1374,17 +1313,13 @@ static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
+ 	if (ret)
+ 		goto err_deinit;
+ 
+-	if (!pci->suspended) {
+-		ret = pci_pwrctrl_create_devices(pci->dev);
+-		if (ret)
+-			goto err_disable_phy;
+-	}
++	ret = pci_pwrctrl_create_devices(pci->dev);
++	if (ret)
++		goto err_disable_phy;
+ 
+-	if (!pp->skip_pwrctrl_off) {
+-		ret = pci_pwrctrl_power_on_devices(pci->dev);
+-		if (ret)
+-			goto err_pwrctrl_destroy;
+-	}
++	ret = pci_pwrctrl_power_on_devices(pci->dev);
++	if (ret)
++		goto err_pwrctrl_destroy;
+ 
+ 	if (pcie->cfg->ops->post_init) {
+ 		ret = pcie->cfg->ops->post_init(pcie);
+@@ -1411,10 +1346,9 @@ static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
+ err_assert_reset:
+ 	qcom_pcie_perst_assert(pcie);
+ err_pwrctrl_power_off:
+-	if (!pp->skip_pwrctrl_off)
+-		pci_pwrctrl_power_off_devices(pci->dev);
++	pci_pwrctrl_power_off_devices(pci->dev);
+ err_pwrctrl_destroy:
+-	if (ret != -EPROBE_DEFER && !pci->suspended)
++	if (ret != -EPROBE_DEFER)
+ 		pci_pwrctrl_destroy_devices(pci->dev);
+ err_disable_phy:
+ 	qcom_pcie_phy_power_off(pcie);
+@@ -1465,18 +1399,10 @@ static void qcom_pcie_host_post_init(struct dw_pcie_rp *pp)
+ 		pcie->cfg->ops->host_post_init(pcie);
+ }
+ 
+-static void qcom_pcie_host_pme_turn_off(struct dw_pcie_rp *pp)
+-{
+-	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
+-
+-	writel(ELBI_SYS_CTRL_PME_TURNOFF_MSG, pci->elbi_base + ELBI_SYS_CTRL);
+-}
+-
+ static const struct dw_pcie_host_ops qcom_pcie_dw_ops = {
+ 	.init		= qcom_pcie_host_init,
+ 	.deinit		= qcom_pcie_host_deinit,
+ 	.post_init	= qcom_pcie_host_post_init,
+-	.pme_turn_off	= qcom_pcie_host_pme_turn_off,
+ };
+ 
+ /* Qcom IP rev.: 2.1.0	Synopsys IP rev.: 4.01a */
+@@ -1486,7 +1412,6 @@ static const struct qcom_pcie_ops ops_2_1_0 = {
+ 	.post_init = qcom_pcie_post_init_2_1_0,
+ 	.deinit = qcom_pcie_deinit_2_1_0,
+ 	.ltssm_enable = qcom_pcie_2_1_0_ltssm_enable,
+-	.get_ltssm = qcom_pcie_2_1_0_get_ltssm,
+ };
+ 
+ /* Qcom IP rev.: 1.0.0	Synopsys IP rev.: 4.11a */
+@@ -1496,7 +1421,6 @@ static const struct qcom_pcie_ops ops_1_0_0 = {
+ 	.post_init = qcom_pcie_post_init_1_0_0,
+ 	.deinit = qcom_pcie_deinit_1_0_0,
+ 	.ltssm_enable = qcom_pcie_2_1_0_ltssm_enable,
+-	.get_ltssm = qcom_pcie_2_1_0_get_ltssm,
+ };
+ 
+ /* Qcom IP rev.: 2.3.2	Synopsys IP rev.: 4.21a */
+@@ -1616,7 +1540,6 @@ static const struct qcom_pcie_cfg cfg_fw_managed = {
+ static const struct dw_pcie_ops dw_pcie_ops = {
+ 	.link_up = qcom_pcie_link_up,
+ 	.start_link = qcom_pcie_start_link,
+-	.get_ltssm = qcom_pcie_get_ltssm,
+ };
+ 
+ static int qcom_pcie_icc_init(struct qcom_pcie *pcie)
+@@ -2109,6 +2032,10 @@ static int qcom_pcie_probe(struct platform_device *pdev)
+ 
+ 	pp->ops = &qcom_pcie_dw_ops;
+ 
++	/* PARF_LTSSM is inaccessible after PME_Turn_Off on SM8550. */
++	if (of_device_is_compatible(dev->of_node, "qcom,pcie-sm8550"))
++		pp->skip_l23_ready = true;
++
+ 	ret = qcom_pcie_parse_ports(pcie);
+ 	if (ret) {
+ 		if (ret != -ENODEV) {
+@@ -2156,6 +2083,35 @@ err_pm_runtime_put:
+ 	return ret;
+ }
+ 
++/*
++ * Use the DT suspend OPP to retain the PCIe DDR/LLCC sleep-set votes
++ * during s2idle. Suspend-to-RAM tears the link down and keeps dropping
++ * the OPP.
++ */
++static int qcom_pcie_set_suspend_opp(struct qcom_pcie *pcie)
++{
++	struct device *dev = pcie->pci->dev;
++	struct dev_pm_opp *opp;
++	unsigned long freq;
++	int ret;
++
++	if (pm_suspend_target_state == PM_SUSPEND_MEM)
++		return dev_pm_opp_set_opp(dev, NULL);
++
++	freq = dev_pm_opp_get_suspend_opp_freq(dev);
++	if (!freq)
++		return dev_pm_opp_set_opp(dev, NULL);
++
++	opp = dev_pm_opp_find_freq_exact(dev, freq, true);
++	if (IS_ERR(opp))
++		return PTR_ERR(opp);
++
++	ret = dev_pm_opp_set_opp(dev, opp);
++	dev_pm_opp_put(opp);
++
++	return ret;
++}
++
+ static int qcom_pcie_suspend_noirq(struct device *dev)
+ {
+ 	struct qcom_pcie *pcie;
+@@ -2178,8 +2134,11 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
+ 		if (ret)
+ 			dev_err(dev, "Failed to disable CPU-PCIe interconnect path: %d\n", ret);
+ 
+-		if (pcie->use_pm_opp)
+-			dev_pm_opp_set_opp(pcie->pci->dev, NULL);
++		if (pcie->use_pm_opp) {
++			ret = qcom_pcie_set_suspend_opp(pcie);
++			if (ret)
++				dev_err(dev, "Failed to set suspend OPP: %d\n", ret);
++		}
+ 	} else {
+ 		/*
+ 		 * Set minimum bandwidth required to keep data path
+@@ -2207,8 +2166,12 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
+ 				dev_err(dev, "Failed to disable CPU-PCIe interconnect path: %d\n",
+ 					ret);
+ 
+-			if (pcie->use_pm_opp)
+-				dev_pm_opp_set_opp(pcie->pci->dev, NULL);
++			if (pcie->use_pm_opp) {
++				ret = qcom_pcie_set_suspend_opp(pcie);
++				if (ret)
++					dev_err(dev, "Failed to set suspend OPP: %d\n",
++						ret);
++			}
+ 		}
+ 	}
+ 	return ret;
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c.orig b/drivers/pci/controller/dwc/pcie-qcom.c.orig
+new file mode 100644
+index 0000000..a743e08
+--- /dev/null
++++ b/drivers/pci/controller/dwc/pcie-qcom.c.orig
+@@ -0,0 +1,2318 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Qualcomm PCIe root complex driver
++ *
++ * Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
++ * Copyright 2015 Linaro Limited.
++ *
++ * Author: Stanimir Varbanov <svarbanov@mm-sol.com>
++ */
++
++#include <linux/clk.h>
++#include <linux/crc8.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/interconnect.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/kernel.h>
++#include <linux/limits.h>
++#include <linux/init.h>
++#include <linux/of.h>
++#include <linux/of_pci.h>
++#include <linux/pci.h>
++#include <linux/pci-ecam.h>
++#include <linux/pci-pwrctrl.h>
++#include <linux/pm_opp.h>
++#include <linux/pm_runtime.h>
++#include <linux/platform_device.h>
++#include <linux/phy/pcie.h>
++#include <linux/phy/phy.h>
++#include <linux/regulator/consumer.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/units.h>
++
++#include "../../pci.h"
++#include "../pci-host-common.h"
++#include "pcie-designware.h"
++#include "pcie-qcom-common.h"
++
++/* PARF registers */
++#define PARF_SYS_CTRL				0x00
++#define PARF_PM_CTRL				0x20
++#define PARF_PCS_DEEMPH				0x34
++#define PARF_PCS_SWING				0x38
++#define PARF_PHY_CTRL				0x40
++#define PARF_PHY_REFCLK				0x4c
++#define PARF_CONFIG_BITS			0x50
++#define PARF_DBI_BASE_ADDR			0x168
++#define PARF_SLV_ADDR_SPACE_SIZE		0x16c
++#define PARF_MHI_CLOCK_RESET_CTRL		0x174
++#define PARF_AXI_MSTR_WR_ADDR_HALT		0x178
++#define PARF_AXI_MSTR_WR_ADDR_HALT_V2		0x1a8
++#define PARF_Q2A_FLUSH				0x1ac
++#define PARF_LTSSM				0x1b0
++#define PARF_SID_OFFSET				0x234
++#define PARF_BDF_TRANSLATE_CFG			0x24c
++#define PARF_DBI_BASE_ADDR_V2			0x350
++#define PARF_DBI_BASE_ADDR_V2_HI		0x354
++#define PARF_SLV_ADDR_SPACE_SIZE_V2		0x358
++#define PARF_SLV_ADDR_SPACE_SIZE_V2_HI		0x35c
++#define PARF_NO_SNOOP_OVERRIDE			0x3d4
++#define PARF_ATU_BASE_ADDR			0x634
++#define PARF_ATU_BASE_ADDR_HI			0x638
++#define PARF_DEVICE_TYPE			0x1000
++#define PARF_BDF_TO_SID_TABLE_N			0x2000
++#define PARF_BDF_TO_SID_CFG			0x2c00
++
++/* ELBI registers */
++#define ELBI_SYS_CTRL				0x04
++
++/* DBI registers */
++#define AXI_MSTR_RESP_COMP_CTRL0		0x818
++#define AXI_MSTR_RESP_COMP_CTRL1		0x81c
++
++/* MHI registers */
++#define PARF_DEBUG_CNT_PM_LINKST_IN_L2		0xc04
++#define PARF_DEBUG_CNT_PM_LINKST_IN_L1		0xc0c
++#define PARF_DEBUG_CNT_PM_LINKST_IN_L0S		0xc10
++#define PARF_DEBUG_CNT_AUX_CLK_IN_L1SUB_L1	0xc84
++#define PARF_DEBUG_CNT_AUX_CLK_IN_L1SUB_L2	0xc88
++
++/* PARF_SYS_CTRL register fields */
++#define MAC_PHY_POWERDOWN_IN_P2_D_MUX_EN	BIT(29)
++#define MST_WAKEUP_EN				BIT(13)
++#define SLV_WAKEUP_EN				BIT(12)
++#define MSTR_ACLK_CGC_DIS			BIT(10)
++#define SLV_ACLK_CGC_DIS			BIT(9)
++#define CORE_CLK_CGC_DIS			BIT(6)
++#define AUX_PWR_DET				BIT(4)
++#define L23_CLK_RMV_DIS				BIT(2)
++#define L1_CLK_RMV_DIS				BIT(1)
++
++/* PARF_PM_CTRL register fields */
++#define REQ_NOT_ENTR_L1				BIT(5)
++
++/* PARF_PCS_DEEMPH register fields */
++#define PCS_DEEMPH_TX_DEEMPH_GEN1(x)		FIELD_PREP(GENMASK(21, 16), x)
++#define PCS_DEEMPH_TX_DEEMPH_GEN2_3_5DB(x)	FIELD_PREP(GENMASK(13, 8), x)
++#define PCS_DEEMPH_TX_DEEMPH_GEN2_6DB(x)	FIELD_PREP(GENMASK(5, 0), x)
++
++/* PARF_PCS_SWING register fields */
++#define PCS_SWING_TX_SWING_FULL(x)		FIELD_PREP(GENMASK(14, 8), x)
++#define PCS_SWING_TX_SWING_LOW(x)		FIELD_PREP(GENMASK(6, 0), x)
++
++/* PARF_PHY_CTRL register fields */
++#define PHY_CTRL_PHY_TX0_TERM_OFFSET_MASK	GENMASK(20, 16)
++#define PHY_CTRL_PHY_TX0_TERM_OFFSET(x)		FIELD_PREP(PHY_CTRL_PHY_TX0_TERM_OFFSET_MASK, x)
++#define PHY_TEST_PWR_DOWN			BIT(0)
++
++/* PARF_PHY_REFCLK register fields */
++#define PHY_REFCLK_SSP_EN			BIT(16)
++#define PHY_REFCLK_USE_PAD			BIT(12)
++
++/* PARF_CONFIG_BITS register fields */
++#define PHY_RX0_EQ(x)				FIELD_PREP(GENMASK(26, 24), x)
++
++/* PARF_SLV_ADDR_SPACE_SIZE register value */
++#define SLV_ADDR_SPACE_SZ			0x80000000
++
++/* PARF_MHI_CLOCK_RESET_CTRL register fields */
++#define AHB_CLK_EN				BIT(0)
++#define MSTR_AXI_CLK_EN				BIT(1)
++#define BYPASS					BIT(4)
++
++/* PARF_AXI_MSTR_WR_ADDR_HALT register fields */
++#define EN					BIT(31)
++
++/* PARF_LTSSM register fields */
++#define LTSSM_EN				BIT(8)
++
++/* PARF_NO_SNOOP_OVERRIDE register fields */
++#define WR_NO_SNOOP_OVERRIDE_EN			BIT(1)
++#define RD_NO_SNOOP_OVERRIDE_EN			BIT(3)
++
++/* PARF_DEVICE_TYPE register fields */
++#define DEVICE_TYPE_RC				0x4
++
++/* PARF_BDF_TO_SID_CFG fields */
++#define BDF_TO_SID_BYPASS			BIT(0)
++
++/* ELBI_SYS_CTRL register fields */
++#define ELBI_SYS_CTRL_LT_ENABLE			BIT(0)
++#define ELBI_SYS_CTRL_PME_TURNOFF_MSG		BIT(4)
++
++/* AXI_MSTR_RESP_COMP_CTRL0 register fields */
++#define CFG_REMOTE_RD_REQ_BRIDGE_SIZE_2K	0x4
++#define CFG_REMOTE_RD_REQ_BRIDGE_SIZE_4K	0x5
++
++/* AXI_MSTR_RESP_COMP_CTRL1 register fields */
++#define CFG_BRIDGE_SB_INIT			BIT(0)
++
++/* PCI_EXP_SLTCAP register fields */
++#define PCIE_CAP_SLOT_POWER_LIMIT_VAL		FIELD_PREP(PCI_EXP_SLTCAP_SPLV, 250)
++#define PCIE_CAP_SLOT_POWER_LIMIT_SCALE		FIELD_PREP(PCI_EXP_SLTCAP_SPLS, 1)
++#define PCIE_CAP_SLOT_VAL			(PCI_EXP_SLTCAP_ABP | \
++						PCI_EXP_SLTCAP_PCP | \
++						PCI_EXP_SLTCAP_MRLSP | \
++						PCI_EXP_SLTCAP_AIP | \
++						PCI_EXP_SLTCAP_PIP | \
++						PCI_EXP_SLTCAP_HPS | \
++						PCI_EXP_SLTCAP_EIP | \
++						PCIE_CAP_SLOT_POWER_LIMIT_VAL | \
++						PCIE_CAP_SLOT_POWER_LIMIT_SCALE)
++
++#define PERST_DELAY_US				1000
++
++#define QCOM_PCIE_CRC8_POLYNOMIAL		(BIT(2) | BIT(1) | BIT(0))
++
++#define QCOM_PCIE_LINK_SPEED_TO_BW(speed) \
++		Mbps_to_icc(PCIE_SPEED2MBS_ENC(pcie_get_link_speed(speed)))
++
++struct qcom_pcie_resources_1_0_0 {
++	struct clk_bulk_data *clks;
++	int num_clks;
++	struct reset_control *core;
++	struct regulator *vdda;
++};
++
++#define QCOM_PCIE_2_1_0_MAX_RESETS		6
++#define QCOM_PCIE_2_1_0_MAX_SUPPLY		3
++struct qcom_pcie_resources_2_1_0 {
++	struct clk_bulk_data *clks;
++	int num_clks;
++	struct reset_control_bulk_data resets[QCOM_PCIE_2_1_0_MAX_RESETS];
++	int num_resets;
++	struct regulator_bulk_data supplies[QCOM_PCIE_2_1_0_MAX_SUPPLY];
++};
++
++#define QCOM_PCIE_2_3_2_MAX_SUPPLY		2
++struct qcom_pcie_resources_2_3_2 {
++	struct clk_bulk_data *clks;
++	int num_clks;
++	struct regulator_bulk_data supplies[QCOM_PCIE_2_3_2_MAX_SUPPLY];
++};
++
++#define QCOM_PCIE_2_3_3_MAX_RESETS		7
++struct qcom_pcie_resources_2_3_3 {
++	struct clk_bulk_data *clks;
++	int num_clks;
++	struct reset_control_bulk_data rst[QCOM_PCIE_2_3_3_MAX_RESETS];
++};
++
++#define QCOM_PCIE_2_4_0_MAX_RESETS		12
++struct qcom_pcie_resources_2_4_0 {
++	struct clk_bulk_data *clks;
++	int num_clks;
++	struct reset_control_bulk_data resets[QCOM_PCIE_2_4_0_MAX_RESETS];
++	int num_resets;
++};
++
++#define QCOM_PCIE_2_7_0_MAX_SUPPLIES		2
++struct qcom_pcie_resources_2_7_0 {
++	struct clk_bulk_data *clks;
++	int num_clks;
++	struct regulator_bulk_data supplies[QCOM_PCIE_2_7_0_MAX_SUPPLIES];
++	struct reset_control *rst;
++};
++
++struct qcom_pcie_resources_2_9_0 {
++	struct clk_bulk_data *clks;
++	int num_clks;
++	struct reset_control *rst;
++};
++
++union qcom_pcie_resources {
++	struct qcom_pcie_resources_1_0_0 v1_0_0;
++	struct qcom_pcie_resources_2_1_0 v2_1_0;
++	struct qcom_pcie_resources_2_3_2 v2_3_2;
++	struct qcom_pcie_resources_2_3_3 v2_3_3;
++	struct qcom_pcie_resources_2_4_0 v2_4_0;
++	struct qcom_pcie_resources_2_7_0 v2_7_0;
++	struct qcom_pcie_resources_2_9_0 v2_9_0;
++};
++
++struct qcom_pcie;
++
++struct qcom_pcie_ops {
++	int (*get_resources)(struct qcom_pcie *pcie);
++	int (*init)(struct qcom_pcie *pcie);
++	int (*post_init)(struct qcom_pcie *pcie);
++	void (*host_post_init)(struct qcom_pcie *pcie);
++	void (*deinit)(struct qcom_pcie *pcie);
++	void (*ltssm_enable)(struct qcom_pcie *pcie);
++	int (*config_sid)(struct qcom_pcie *pcie);
++};
++
++ /**
++  * struct qcom_pcie_cfg - Per SoC config struct
++  * @ops: qcom PCIe ops structure
++  * @override_no_snoop: Override NO_SNOOP attribute in TLP to enable cache
++  * snooping
++  * @firmware_managed: Set if the Root Complex is firmware managed
++  */
++struct qcom_pcie_cfg {
++	const struct qcom_pcie_ops *ops;
++	bool override_no_snoop;
++	bool firmware_managed;
++	bool no_l0s;
++};
++
++struct qcom_pcie_perst {
++	struct list_head list;
++	struct gpio_desc *desc;
++};
++
++struct qcom_pcie_port {
++	struct list_head list;
++	struct phy *phy;
++	u32 l1ss_t_power_on;
++	struct list_head perst;
++};
++
++struct qcom_pcie {
++	struct dw_pcie *pci;
++	void __iomem *parf;			/* DT parf */
++	void __iomem *mhi;
++	union qcom_pcie_resources res;
++	struct icc_path *icc_mem;
++	struct icc_path *icc_cpu;
++	const struct qcom_pcie_cfg *cfg;
++	struct dentry *debugfs;
++	struct list_head ports;
++	struct gpio_desc *reset;
++	bool use_pm_opp;
++};
++
++#define to_qcom_pcie(x)		dev_get_drvdata((x)->dev)
++
++static void __qcom_pcie_perst_assert(struct qcom_pcie *pcie, bool assert)
++{
++	struct qcom_pcie_perst *perst;
++	struct qcom_pcie_port *port;
++	int val = assert ? 1 : 0;
++
++	list_for_each_entry(port, &pcie->ports, list) {
++		list_for_each_entry(perst, &port->perst, list)
++			gpiod_set_value_cansleep(perst->desc, val);
++	}
++
++	usleep_range(PERST_DELAY_US, PERST_DELAY_US + 500);
++}
++
++static void qcom_pcie_perst_assert(struct qcom_pcie *pcie)
++{
++	__qcom_pcie_perst_assert(pcie, true);
++}
++
++static void qcom_pcie_perst_deassert(struct qcom_pcie *pcie)
++{
++	/* Ensure that PERST# has been asserted for at least 100 ms */
++	msleep(PCIE_T_PVPERL_MS);
++	__qcom_pcie_perst_assert(pcie, false);
++}
++
++static int qcom_pcie_start_link(struct dw_pcie *pci)
++{
++	struct qcom_pcie *pcie = to_qcom_pcie(pci);
++
++	qcom_pcie_common_set_equalization(pci);
++
++	if (pcie_get_link_speed(pci->max_link_speed) == PCIE_SPEED_16_0GT)
++		qcom_pcie_common_set_16gt_lane_margining(pci);
++
++	/* Enable Link Training state machine */
++	if (pcie->cfg->ops->ltssm_enable)
++		pcie->cfg->ops->ltssm_enable(pcie);
++
++	return 0;
++}
++
++static void qcom_pcie_clear_aspm_l0s(struct dw_pcie *pci)
++{
++	struct qcom_pcie *pcie = to_qcom_pcie(pci);
++	u16 offset;
++	u32 val;
++
++	if (!pcie->cfg->no_l0s)
++		return;
++
++	offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++
++	dw_pcie_dbi_ro_wr_en(pci);
++
++	val = readl(pci->dbi_base + offset + PCI_EXP_LNKCAP);
++	val &= ~PCI_EXP_LNKCAP_ASPM_L0S;
++	writel(val, pci->dbi_base + offset + PCI_EXP_LNKCAP);
++
++	dw_pcie_dbi_ro_wr_dis(pci);
++}
++
++static void qcom_pcie_set_slot_nccs(struct dw_pcie *pci)
++{
++	u16 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++	u32 val;
++
++	dw_pcie_dbi_ro_wr_en(pci);
++
++	/*
++	 * Qcom PCIe Root Ports do not support generating command completion
++	 * notifications for the Hot-Plug commands. So set the NCCS field to
++	 * avoid waiting for the completions.
++	 */
++	val = readl(pci->dbi_base + offset + PCI_EXP_SLTCAP);
++	val |= PCI_EXP_SLTCAP_NCCS;
++	writel(val, pci->dbi_base + offset + PCI_EXP_SLTCAP);
++
++	dw_pcie_dbi_ro_wr_dis(pci);
++}
++
++static void qcom_pcie_configure_dbi_base(struct qcom_pcie *pcie)
++{
++	struct dw_pcie *pci = pcie->pci;
++
++	if (pci->dbi_phys_addr) {
++		/*
++		 * PARF_DBI_BASE_ADDR register is in CPU domain and require to
++		 * be programmed with CPU physical address.
++		 */
++		writel(lower_32_bits(pci->dbi_phys_addr), pcie->parf +
++							PARF_DBI_BASE_ADDR);
++		writel(SLV_ADDR_SPACE_SZ, pcie->parf +
++						PARF_SLV_ADDR_SPACE_SIZE);
++	}
++}
++
++static void qcom_pcie_configure_dbi_atu_base(struct qcom_pcie *pcie)
++{
++	struct dw_pcie *pci = pcie->pci;
++
++	if (pci->dbi_phys_addr) {
++		/*
++		 * PARF_DBI_BASE_ADDR_V2 and PARF_ATU_BASE_ADDR registers are
++		 * in CPU domain and require to be programmed with CPU
++		 * physical addresses.
++		 */
++		writel(lower_32_bits(pci->dbi_phys_addr), pcie->parf +
++							PARF_DBI_BASE_ADDR_V2);
++		writel(upper_32_bits(pci->dbi_phys_addr), pcie->parf +
++						PARF_DBI_BASE_ADDR_V2_HI);
++
++		if (pci->atu_phys_addr) {
++			writel(lower_32_bits(pci->atu_phys_addr), pcie->parf +
++							PARF_ATU_BASE_ADDR);
++			writel(upper_32_bits(pci->atu_phys_addr), pcie->parf +
++							PARF_ATU_BASE_ADDR_HI);
++		}
++
++		writel(0x0, pcie->parf + PARF_SLV_ADDR_SPACE_SIZE_V2);
++		writel(SLV_ADDR_SPACE_SZ, pcie->parf +
++					PARF_SLV_ADDR_SPACE_SIZE_V2_HI);
++	}
++}
++
++static void qcom_pcie_2_1_0_ltssm_enable(struct qcom_pcie *pcie)
++{
++	struct dw_pcie *pci = pcie->pci;
++	u32 val;
++
++	if (!pci->elbi_base) {
++		dev_err(pci->dev, "ELBI is not present\n");
++		return;
++	}
++	/* enable link training */
++	val = readl(pci->elbi_base + ELBI_SYS_CTRL);
++	val |= ELBI_SYS_CTRL_LT_ENABLE;
++	writel(val, pci->elbi_base + ELBI_SYS_CTRL);
++}
++
++static int qcom_pcie_get_resources_2_1_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_1_0 *res = &pcie->res.v2_1_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	bool is_apq = of_device_is_compatible(dev->of_node, "qcom,pcie-apq8064");
++	int ret;
++
++	res->supplies[0].supply = "vdda";
++	res->supplies[1].supply = "vdda_phy";
++	res->supplies[2].supply = "vdda_refclk";
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(res->supplies),
++				      res->supplies);
++	if (ret)
++		return ret;
++
++	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
++	if (res->num_clks < 0) {
++		dev_err(dev, "Failed to get clocks\n");
++		return res->num_clks;
++	}
++
++	res->resets[0].id = "pci";
++	res->resets[1].id = "axi";
++	res->resets[2].id = "ahb";
++	res->resets[3].id = "por";
++	res->resets[4].id = "phy";
++	res->resets[5].id = "ext";
++
++	/* ext is optional on APQ8016 */
++	res->num_resets = is_apq ? 5 : 6;
++	ret = devm_reset_control_bulk_get_exclusive(dev, res->num_resets, res->resets);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++static void qcom_pcie_deinit_2_1_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_1_0 *res = &pcie->res.v2_1_0;
++
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++	reset_control_bulk_assert(res->num_resets, res->resets);
++
++	writel(1, pcie->parf + PARF_PHY_CTRL);
++
++	regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
++}
++
++static int qcom_pcie_init_2_1_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_1_0 *res = &pcie->res.v2_1_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	int ret;
++
++	/* reset the PCIe interface as uboot can leave it undefined state */
++	ret = reset_control_bulk_assert(res->num_resets, res->resets);
++	if (ret < 0) {
++		dev_err(dev, "cannot assert resets\n");
++		return ret;
++	}
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(res->supplies), res->supplies);
++	if (ret < 0) {
++		dev_err(dev, "cannot enable regulators\n");
++		return ret;
++	}
++
++	ret = reset_control_bulk_deassert(res->num_resets, res->resets);
++	if (ret < 0) {
++		dev_err(dev, "cannot deassert resets\n");
++		regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int qcom_pcie_post_init_2_1_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_1_0 *res = &pcie->res.v2_1_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	struct device_node *node = dev->of_node;
++	u32 val;
++	int ret;
++
++	/* enable PCIe clocks and resets */
++	val = readl(pcie->parf + PARF_PHY_CTRL);
++	val &= ~PHY_TEST_PWR_DOWN;
++	writel(val, pcie->parf + PARF_PHY_CTRL);
++
++	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	if (ret)
++		return ret;
++
++	if (of_device_is_compatible(node, "qcom,pcie-ipq8064") ||
++	    of_device_is_compatible(node, "qcom,pcie-ipq8064-v2")) {
++		writel(PCS_DEEMPH_TX_DEEMPH_GEN1(24) |
++			       PCS_DEEMPH_TX_DEEMPH_GEN2_3_5DB(24) |
++			       PCS_DEEMPH_TX_DEEMPH_GEN2_6DB(34),
++		       pcie->parf + PARF_PCS_DEEMPH);
++		writel(PCS_SWING_TX_SWING_FULL(120) |
++			       PCS_SWING_TX_SWING_LOW(120),
++		       pcie->parf + PARF_PCS_SWING);
++		writel(PHY_RX0_EQ(4), pcie->parf + PARF_CONFIG_BITS);
++	}
++
++	if (of_device_is_compatible(node, "qcom,pcie-ipq8064")) {
++		/* set TX termination offset */
++		val = readl(pcie->parf + PARF_PHY_CTRL);
++		val &= ~PHY_CTRL_PHY_TX0_TERM_OFFSET_MASK;
++		val |= PHY_CTRL_PHY_TX0_TERM_OFFSET(7);
++		writel(val, pcie->parf + PARF_PHY_CTRL);
++	}
++
++	/* enable external reference clock */
++	val = readl(pcie->parf + PARF_PHY_REFCLK);
++	/* USE_PAD is required only for ipq806x */
++	if (!of_device_is_compatible(node, "qcom,pcie-apq8064"))
++		val &= ~PHY_REFCLK_USE_PAD;
++	val |= PHY_REFCLK_SSP_EN;
++	writel(val, pcie->parf + PARF_PHY_REFCLK);
++
++	/* wait for clock acquisition */
++	usleep_range(1000, 1500);
++
++	/* Set the Max TLP size to 2K, instead of using default of 4K */
++	writel(CFG_REMOTE_RD_REQ_BRIDGE_SIZE_2K,
++	       pci->dbi_base + AXI_MSTR_RESP_COMP_CTRL0);
++	writel(CFG_BRIDGE_SB_INIT,
++	       pci->dbi_base + AXI_MSTR_RESP_COMP_CTRL1);
++
++	qcom_pcie_set_slot_nccs(pcie->pci);
++
++	return 0;
++}
++
++static int qcom_pcie_get_resources_1_0_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_1_0_0 *res = &pcie->res.v1_0_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++
++	res->vdda = devm_regulator_get(dev, "vdda");
++	if (IS_ERR(res->vdda))
++		return PTR_ERR(res->vdda);
++
++	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
++	if (res->num_clks < 0) {
++		dev_err(dev, "Failed to get clocks\n");
++		return res->num_clks;
++	}
++
++	res->core = devm_reset_control_get_exclusive(dev, "core");
++	return PTR_ERR_OR_ZERO(res->core);
++}
++
++static void qcom_pcie_deinit_1_0_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_1_0_0 *res = &pcie->res.v1_0_0;
++
++	reset_control_assert(res->core);
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++	regulator_disable(res->vdda);
++}
++
++static int qcom_pcie_init_1_0_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_1_0_0 *res = &pcie->res.v1_0_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	int ret;
++
++	ret = reset_control_deassert(res->core);
++	if (ret) {
++		dev_err(dev, "cannot deassert core reset\n");
++		return ret;
++	}
++
++	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	if (ret) {
++		dev_err(dev, "cannot prepare/enable clocks\n");
++		goto err_assert_reset;
++	}
++
++	ret = regulator_enable(res->vdda);
++	if (ret) {
++		dev_err(dev, "cannot enable vdda regulator\n");
++		goto err_disable_clks;
++	}
++
++	return 0;
++
++err_disable_clks:
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++err_assert_reset:
++	reset_control_assert(res->core);
++
++	return ret;
++}
++
++static int qcom_pcie_post_init_1_0_0(struct qcom_pcie *pcie)
++{
++	qcom_pcie_configure_dbi_base(pcie);
++
++	if (IS_ENABLED(CONFIG_PCI_MSI)) {
++		u32 val = readl(pcie->parf + PARF_AXI_MSTR_WR_ADDR_HALT);
++
++		val |= EN;
++		writel(val, pcie->parf + PARF_AXI_MSTR_WR_ADDR_HALT);
++	}
++
++	qcom_pcie_set_slot_nccs(pcie->pci);
++
++	return 0;
++}
++
++static void qcom_pcie_2_3_2_ltssm_enable(struct qcom_pcie *pcie)
++{
++	u32 val;
++
++	/* enable link training */
++	val = readl(pcie->parf + PARF_LTSSM);
++	val |= LTSSM_EN;
++	writel(val, pcie->parf + PARF_LTSSM);
++}
++
++static int qcom_pcie_get_resources_2_3_2(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	int ret;
++
++	res->supplies[0].supply = "vdda";
++	res->supplies[1].supply = "vddpe-3v3";
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(res->supplies),
++				      res->supplies);
++	if (ret)
++		return ret;
++
++	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
++	if (res->num_clks < 0) {
++		dev_err(dev, "Failed to get clocks\n");
++		return res->num_clks;
++	}
++
++	return 0;
++}
++
++static void qcom_pcie_deinit_2_3_2(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
++
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++	regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
++}
++
++static int qcom_pcie_init_2_3_2(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_3_2 *res = &pcie->res.v2_3_2;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	int ret;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(res->supplies), res->supplies);
++	if (ret < 0) {
++		dev_err(dev, "cannot enable regulators\n");
++		return ret;
++	}
++
++	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	if (ret) {
++		dev_err(dev, "cannot prepare/enable clocks\n");
++		regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int qcom_pcie_post_init_2_3_2(struct qcom_pcie *pcie)
++{
++	u32 val;
++
++	/* enable PCIe clocks and resets */
++	val = readl(pcie->parf + PARF_PHY_CTRL);
++	val &= ~PHY_TEST_PWR_DOWN;
++	writel(val, pcie->parf + PARF_PHY_CTRL);
++
++	qcom_pcie_configure_dbi_base(pcie);
++
++	/* MAC PHY_POWERDOWN MUX DISABLE  */
++	val = readl(pcie->parf + PARF_SYS_CTRL);
++	val &= ~MAC_PHY_POWERDOWN_IN_P2_D_MUX_EN;
++	writel(val, pcie->parf + PARF_SYS_CTRL);
++
++	val = readl(pcie->parf + PARF_MHI_CLOCK_RESET_CTRL);
++	val |= BYPASS;
++	writel(val, pcie->parf + PARF_MHI_CLOCK_RESET_CTRL);
++
++	val = readl(pcie->parf + PARF_AXI_MSTR_WR_ADDR_HALT_V2);
++	val |= EN;
++	writel(val, pcie->parf + PARF_AXI_MSTR_WR_ADDR_HALT_V2);
++
++	qcom_pcie_set_slot_nccs(pcie->pci);
++
++	return 0;
++}
++
++static int qcom_pcie_get_resources_2_4_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_4_0 *res = &pcie->res.v2_4_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	bool is_ipq = of_device_is_compatible(dev->of_node, "qcom,pcie-ipq4019");
++	int ret;
++
++	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
++	if (res->num_clks < 0) {
++		dev_err(dev, "Failed to get clocks\n");
++		return res->num_clks;
++	}
++
++	res->resets[0].id = "axi_m";
++	res->resets[1].id = "axi_s";
++	res->resets[2].id = "axi_m_sticky";
++	res->resets[3].id = "pipe_sticky";
++	res->resets[4].id = "pwr";
++	res->resets[5].id = "ahb";
++	res->resets[6].id = "pipe";
++	res->resets[7].id = "axi_m_vmid";
++	res->resets[8].id = "axi_s_xpu";
++	res->resets[9].id = "parf";
++	res->resets[10].id = "phy";
++	res->resets[11].id = "phy_ahb";
++
++	res->num_resets = is_ipq ? 12 : 6;
++
++	ret = devm_reset_control_bulk_get_exclusive(dev, res->num_resets, res->resets);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++static void qcom_pcie_deinit_2_4_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_4_0 *res = &pcie->res.v2_4_0;
++
++	reset_control_bulk_assert(res->num_resets, res->resets);
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++}
++
++static int qcom_pcie_init_2_4_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_4_0 *res = &pcie->res.v2_4_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	int ret;
++
++	ret = reset_control_bulk_assert(res->num_resets, res->resets);
++	if (ret < 0) {
++		dev_err(dev, "cannot assert resets\n");
++		return ret;
++	}
++
++	usleep_range(10000, 12000);
++
++	ret = reset_control_bulk_deassert(res->num_resets, res->resets);
++	if (ret < 0) {
++		dev_err(dev, "cannot deassert resets\n");
++		return ret;
++	}
++
++	usleep_range(10000, 12000);
++
++	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	if (ret) {
++		reset_control_bulk_assert(res->num_resets, res->resets);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int qcom_pcie_get_resources_2_3_3(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_3_3 *res = &pcie->res.v2_3_3;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	int ret;
++
++	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
++	if (res->num_clks < 0) {
++		dev_err(dev, "Failed to get clocks\n");
++		return res->num_clks;
++	}
++
++	res->rst[0].id = "axi_m";
++	res->rst[1].id = "axi_s";
++	res->rst[2].id = "pipe";
++	res->rst[3].id = "axi_m_sticky";
++	res->rst[4].id = "sticky";
++	res->rst[5].id = "ahb";
++	res->rst[6].id = "sleep";
++
++	ret = devm_reset_control_bulk_get_exclusive(dev, ARRAY_SIZE(res->rst), res->rst);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++static void qcom_pcie_deinit_2_3_3(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_3_3 *res = &pcie->res.v2_3_3;
++
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++}
++
++static int qcom_pcie_init_2_3_3(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_3_3 *res = &pcie->res.v2_3_3;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	int ret;
++
++	ret = reset_control_bulk_assert(ARRAY_SIZE(res->rst), res->rst);
++	if (ret < 0) {
++		dev_err(dev, "cannot assert resets\n");
++		return ret;
++	}
++
++	usleep_range(2000, 2500);
++
++	ret = reset_control_bulk_deassert(ARRAY_SIZE(res->rst), res->rst);
++	if (ret < 0) {
++		dev_err(dev, "cannot deassert resets\n");
++		return ret;
++	}
++
++	/*
++	 * Don't have a way to see if the reset has completed.
++	 * Wait for some time.
++	 */
++	usleep_range(2000, 2500);
++
++	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	if (ret) {
++		dev_err(dev, "cannot prepare/enable clocks\n");
++		goto err_assert_resets;
++	}
++
++	return 0;
++
++err_assert_resets:
++	/*
++	 * Not checking for failure, will anyway return
++	 * the original failure in 'ret'.
++	 */
++	reset_control_bulk_assert(ARRAY_SIZE(res->rst), res->rst);
++
++	return ret;
++}
++
++static int qcom_pcie_post_init_2_3_3(struct qcom_pcie *pcie)
++{
++	struct dw_pcie *pci = pcie->pci;
++	u16 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++	u32 val;
++
++	val = readl(pcie->parf + PARF_PHY_CTRL);
++	val &= ~PHY_TEST_PWR_DOWN;
++	writel(val, pcie->parf + PARF_PHY_CTRL);
++
++	qcom_pcie_configure_dbi_atu_base(pcie);
++
++	writel(MST_WAKEUP_EN | SLV_WAKEUP_EN | MSTR_ACLK_CGC_DIS
++		| SLV_ACLK_CGC_DIS | CORE_CLK_CGC_DIS |
++		AUX_PWR_DET | L23_CLK_RMV_DIS | L1_CLK_RMV_DIS,
++		pcie->parf + PARF_SYS_CTRL);
++	writel(0, pcie->parf + PARF_Q2A_FLUSH);
++
++	writel(PCI_COMMAND_MASTER, pci->dbi_base + PCI_COMMAND);
++
++	dw_pcie_dbi_ro_wr_en(pci);
++
++	writel(PCIE_CAP_SLOT_VAL, pci->dbi_base + offset + PCI_EXP_SLTCAP);
++
++	val = readl(pci->dbi_base + offset + PCI_EXP_LNKCAP);
++	val &= ~PCI_EXP_LNKCAP_ASPMS;
++	writel(val, pci->dbi_base + offset + PCI_EXP_LNKCAP);
++
++	writel(PCI_EXP_DEVCTL2_COMP_TMOUT_DIS, pci->dbi_base + offset +
++		PCI_EXP_DEVCTL2);
++
++	dw_pcie_dbi_ro_wr_dis(pci);
++
++	return 0;
++}
++
++static int qcom_pcie_get_resources_2_7_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_7_0 *res = &pcie->res.v2_7_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	int ret;
++
++	res->rst = devm_reset_control_array_get_exclusive(dev);
++	if (IS_ERR(res->rst))
++		return PTR_ERR(res->rst);
++
++	res->supplies[0].supply = "vdda";
++	res->supplies[1].supply = "vddpe-3v3";
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(res->supplies),
++				      res->supplies);
++	if (ret)
++		return ret;
++
++	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
++	if (res->num_clks < 0) {
++		dev_err(dev, "Failed to get clocks\n");
++		return res->num_clks;
++	}
++
++	return 0;
++}
++
++static int qcom_pcie_init_2_7_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_7_0 *res = &pcie->res.v2_7_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	u32 val;
++	int ret;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(res->supplies), res->supplies);
++	if (ret < 0) {
++		dev_err(dev, "cannot enable regulators\n");
++		return ret;
++	}
++
++	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	if (ret < 0)
++		goto err_disable_regulators;
++
++	ret = reset_control_assert(res->rst);
++	if (ret) {
++		dev_err(dev, "reset assert failed (%d)\n", ret);
++		goto err_disable_clocks;
++	}
++
++	usleep_range(1000, 1500);
++
++	ret = reset_control_deassert(res->rst);
++	if (ret) {
++		dev_err(dev, "reset deassert failed (%d)\n", ret);
++		goto err_disable_clocks;
++	}
++
++	/* Wait for reset to complete, required on SM8450 */
++	usleep_range(1000, 1500);
++
++	/* configure PCIe to RC mode */
++	writel(DEVICE_TYPE_RC, pcie->parf + PARF_DEVICE_TYPE);
++
++	/* enable PCIe clocks and resets */
++	val = readl(pcie->parf + PARF_PHY_CTRL);
++	val &= ~PHY_TEST_PWR_DOWN;
++	writel(val, pcie->parf + PARF_PHY_CTRL);
++
++	qcom_pcie_configure_dbi_atu_base(pcie);
++
++	/* MAC PHY_POWERDOWN MUX DISABLE  */
++	val = readl(pcie->parf + PARF_SYS_CTRL);
++	val &= ~MAC_PHY_POWERDOWN_IN_P2_D_MUX_EN;
++	writel(val, pcie->parf + PARF_SYS_CTRL);
++
++	val = readl(pcie->parf + PARF_MHI_CLOCK_RESET_CTRL);
++	val |= BYPASS;
++	writel(val, pcie->parf + PARF_MHI_CLOCK_RESET_CTRL);
++
++	/* Enable L1 and L1SS */
++	val = readl(pcie->parf + PARF_PM_CTRL);
++	val &= ~REQ_NOT_ENTR_L1;
++	writel(val, pcie->parf + PARF_PM_CTRL);
++
++	pci->l1ss_support = true;
++
++	val = readl(pcie->parf + PARF_AXI_MSTR_WR_ADDR_HALT_V2);
++	val |= EN;
++	writel(val, pcie->parf + PARF_AXI_MSTR_WR_ADDR_HALT_V2);
++
++	return 0;
++err_disable_clocks:
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++err_disable_regulators:
++	regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
++
++	return ret;
++}
++
++static int qcom_pcie_post_init_2_7_0(struct qcom_pcie *pcie)
++{
++	const struct qcom_pcie_cfg *pcie_cfg = pcie->cfg;
++
++	if (pcie_cfg->override_no_snoop)
++		writel(WR_NO_SNOOP_OVERRIDE_EN | RD_NO_SNOOP_OVERRIDE_EN,
++				pcie->parf + PARF_NO_SNOOP_OVERRIDE);
++
++	qcom_pcie_set_slot_nccs(pcie->pci);
++
++	return 0;
++}
++
++static int qcom_pcie_enable_aspm(struct pci_dev *pdev, void *userdata)
++{
++	/*
++	 * Downstream devices need to be in D0 state before enabling PCI PM
++	 * substates.
++	 */
++	pci_set_power_state_locked(pdev, PCI_D0);
++	pci_enable_link_state_locked(pdev, PCIE_LINK_STATE_ALL);
++
++	return 0;
++}
++
++static void qcom_pcie_host_post_init_2_7_0(struct qcom_pcie *pcie)
++{
++	struct dw_pcie_rp *pp = &pcie->pci->pp;
++
++	pci_walk_bus(pp->bridge->bus, qcom_pcie_enable_aspm, NULL);
++}
++
++static void qcom_pcie_deinit_2_7_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_7_0 *res = &pcie->res.v2_7_0;
++
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++
++	regulator_bulk_disable(ARRAY_SIZE(res->supplies), res->supplies);
++}
++
++static int qcom_pcie_config_sid_1_9_0(struct qcom_pcie *pcie)
++{
++	/* iommu map structure */
++	struct {
++		u32 bdf;
++		u32 phandle;
++		u32 smmu_sid;
++		u32 smmu_sid_len;
++	} *map;
++	void __iomem *bdf_to_sid_base = pcie->parf + PARF_BDF_TO_SID_TABLE_N;
++	struct device *dev = pcie->pci->dev;
++	u8 qcom_pcie_crc8_table[CRC8_TABLE_SIZE];
++	int i, nr_map, size = 0;
++	u32 smmu_sid_base;
++	u32 val;
++
++	of_get_property(dev->of_node, "iommu-map", &size);
++	if (!size)
++		return 0;
++
++	/* Enable BDF to SID translation by disabling bypass mode (default) */
++	val = readl(pcie->parf + PARF_BDF_TO_SID_CFG);
++	val &= ~BDF_TO_SID_BYPASS;
++	writel(val, pcie->parf + PARF_BDF_TO_SID_CFG);
++
++	map = kzalloc(size, GFP_KERNEL);
++	if (!map)
++		return -ENOMEM;
++
++	of_property_read_u32_array(dev->of_node, "iommu-map", (u32 *)map,
++				   size / sizeof(u32));
++
++	nr_map = size / (sizeof(*map));
++
++	crc8_populate_msb(qcom_pcie_crc8_table, QCOM_PCIE_CRC8_POLYNOMIAL);
++
++	/* Registers need to be zero out first */
++	memset_io(bdf_to_sid_base, 0, CRC8_TABLE_SIZE * sizeof(u32));
++
++	/* Extract the SMMU SID base from the first entry of iommu-map */
++	smmu_sid_base = map[0].smmu_sid;
++
++	/* Look for an available entry to hold the mapping */
++	for (i = 0; i < nr_map; i++) {
++		__be16 bdf_be = cpu_to_be16(map[i].bdf);
++		u32 val;
++		u8 hash;
++
++		hash = crc8(qcom_pcie_crc8_table, (u8 *)&bdf_be, sizeof(bdf_be), 0);
++
++		val = readl(bdf_to_sid_base + hash * sizeof(u32));
++
++		/* If the register is already populated, look for next available entry */
++		while (val) {
++			u8 current_hash = hash++;
++			u8 next_mask = 0xff;
++
++			/* If NEXT field is NULL then update it with next hash */
++			if (!(val & next_mask)) {
++				val |= (u32)hash;
++				writel(val, bdf_to_sid_base + current_hash * sizeof(u32));
++			}
++
++			val = readl(bdf_to_sid_base + hash * sizeof(u32));
++		}
++
++		/* BDF [31:16] | SID [15:8] | NEXT [7:0] */
++		val = map[i].bdf << 16 | (map[i].smmu_sid - smmu_sid_base) << 8 | 0;
++		writel(val, bdf_to_sid_base + hash * sizeof(u32));
++	}
++
++	kfree(map);
++
++	return 0;
++}
++
++static int qcom_pcie_get_resources_2_9_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_9_0 *res = &pcie->res.v2_9_0;
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++
++	res->num_clks = devm_clk_bulk_get_all(dev, &res->clks);
++	if (res->num_clks < 0) {
++		dev_err(dev, "Failed to get clocks\n");
++		return res->num_clks;
++	}
++
++	res->rst = devm_reset_control_array_get_exclusive(dev);
++	if (IS_ERR(res->rst))
++		return PTR_ERR(res->rst);
++
++	return 0;
++}
++
++static void qcom_pcie_deinit_2_9_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_9_0 *res = &pcie->res.v2_9_0;
++
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++}
++
++static int qcom_pcie_init_2_9_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_9_0 *res = &pcie->res.v2_9_0;
++	struct device *dev = pcie->pci->dev;
++	int ret;
++
++	ret = reset_control_assert(res->rst);
++	if (ret) {
++		dev_err(dev, "reset assert failed (%d)\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Delay periods before and after reset deassert are working values
++	 * from downstream Codeaurora kernel
++	 */
++	usleep_range(2000, 2500);
++
++	ret = reset_control_deassert(res->rst);
++	if (ret) {
++		dev_err(dev, "reset deassert failed (%d)\n", ret);
++		return ret;
++	}
++
++	usleep_range(2000, 2500);
++
++	return clk_bulk_prepare_enable(res->num_clks, res->clks);
++}
++
++static int qcom_pcie_post_init_2_9_0(struct qcom_pcie *pcie)
++{
++	struct dw_pcie *pci = pcie->pci;
++	u16 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++	u32 val;
++	int i;
++
++	val = readl(pcie->parf + PARF_PHY_CTRL);
++	val &= ~PHY_TEST_PWR_DOWN;
++	writel(val, pcie->parf + PARF_PHY_CTRL);
++
++	qcom_pcie_configure_dbi_atu_base(pcie);
++
++	writel(DEVICE_TYPE_RC, pcie->parf + PARF_DEVICE_TYPE);
++	writel(BYPASS | MSTR_AXI_CLK_EN | AHB_CLK_EN,
++		pcie->parf + PARF_MHI_CLOCK_RESET_CTRL);
++	writel(GEN3_RELATED_OFF_RXEQ_RGRDLESS_RXTS |
++		GEN3_RELATED_OFF_GEN3_ZRXDC_NONCOMPL,
++		pci->dbi_base + GEN3_RELATED_OFF);
++
++	writel(MST_WAKEUP_EN | SLV_WAKEUP_EN | MSTR_ACLK_CGC_DIS |
++		SLV_ACLK_CGC_DIS | CORE_CLK_CGC_DIS |
++		AUX_PWR_DET | L23_CLK_RMV_DIS | L1_CLK_RMV_DIS,
++		pcie->parf + PARF_SYS_CTRL);
++
++	writel(0, pcie->parf + PARF_Q2A_FLUSH);
++
++	dw_pcie_dbi_ro_wr_en(pci);
++
++	writel(PCIE_CAP_SLOT_VAL, pci->dbi_base + offset + PCI_EXP_SLTCAP);
++
++	val = readl(pci->dbi_base + offset + PCI_EXP_LNKCAP);
++	val &= ~PCI_EXP_LNKCAP_ASPMS;
++	writel(val, pci->dbi_base + offset + PCI_EXP_LNKCAP);
++
++	writel(PCI_EXP_DEVCTL2_COMP_TMOUT_DIS, pci->dbi_base + offset +
++			PCI_EXP_DEVCTL2);
++
++	dw_pcie_dbi_ro_wr_dis(pci);
++
++	for (i = 0; i < 256; i++)
++		writel(0, pcie->parf + PARF_BDF_TO_SID_TABLE_N + (4 * i));
++
++	return 0;
++}
++
++static bool qcom_pcie_link_up(struct dw_pcie *pci)
++{
++	u16 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++	u16 val = readw(pci->dbi_base + offset + PCI_EXP_LNKSTA);
++
++	return val & PCI_EXP_LNKSTA_DLLLA;
++}
++
++static void qcom_pcie_phy_power_off(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_port *port;
++
++	list_for_each_entry(port, &pcie->ports, list)
++		phy_power_off(port->phy);
++}
++
++static int qcom_pcie_phy_power_on(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_port *port;
++	int ret;
++
++	list_for_each_entry(port, &pcie->ports, list) {
++		ret = phy_set_mode_ext(port->phy, PHY_MODE_PCIE, PHY_MODE_PCIE_RC);
++		if (ret)
++			return ret;
++
++		ret = phy_power_on(port->phy);
++		if (ret) {
++			qcom_pcie_phy_power_off(pcie);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static void qcom_pcie_configure_ports(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_port *port;
++
++	list_for_each_entry(port, &pcie->ports, list)
++		dw_pcie_program_t_power_on(pcie->pci, port->l1ss_t_power_on);
++}
++
++static int qcom_pcie_host_init(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct qcom_pcie *pcie = to_qcom_pcie(pci);
++	int ret;
++
++	qcom_pcie_perst_assert(pcie);
++
++	ret = pcie->cfg->ops->init(pcie);
++	if (ret)
++		return ret;
++
++	ret = qcom_pcie_phy_power_on(pcie);
++	if (ret)
++		goto err_deinit;
++
++	if (!pci->suspended) {
++		ret = pci_pwrctrl_create_devices(pci->dev);
++		if (ret)
++			goto err_disable_phy;
++	}
++
++	if (!pp->skip_pwrctrl_off) {
++		ret = pci_pwrctrl_power_on_devices(pci->dev);
++		if (ret)
++			goto err_pwrctrl_destroy;
++	}
++
++	if (pcie->cfg->ops->post_init) {
++		ret = pcie->cfg->ops->post_init(pcie);
++		if (ret)
++			goto err_pwrctrl_power_off;
++	}
++
++	qcom_pcie_clear_aspm_l0s(pcie->pci);
++	dw_pcie_remove_capability(pcie->pci, PCI_CAP_ID_MSIX);
++	dw_pcie_remove_ext_capability(pcie->pci, PCI_EXT_CAP_ID_DPC);
++
++	qcom_pcie_configure_ports(pcie);
++
++	qcom_pcie_perst_deassert(pcie);
++
++	if (pcie->cfg->ops->config_sid) {
++		ret = pcie->cfg->ops->config_sid(pcie);
++		if (ret)
++			goto err_assert_reset;
++	}
++
++	return 0;
++
++err_assert_reset:
++	qcom_pcie_perst_assert(pcie);
++err_pwrctrl_power_off:
++	if (!pp->skip_pwrctrl_off)
++		pci_pwrctrl_power_off_devices(pci->dev);
++err_pwrctrl_destroy:
++	if (ret != -EPROBE_DEFER && !pci->suspended)
++		pci_pwrctrl_destroy_devices(pci->dev);
++err_disable_phy:
++	qcom_pcie_phy_power_off(pcie);
++err_deinit:
++	pcie->cfg->ops->deinit(pcie);
++
++	return ret;
++}
++
++static void qcom_pcie_host_deinit(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct qcom_pcie *pcie = to_qcom_pcie(pci);
++
++	qcom_pcie_perst_assert(pcie);
++
++	if (!pci->pp.skip_pwrctrl_off) {
++		/*
++		 * No need to destroy pwrctrl devices as this function only
++		 * gets called during system suspend as of now.
++		 */
++		pci_pwrctrl_power_off_devices(pci->dev);
++	}
++
++	qcom_pcie_phy_power_off(pcie);
++	pcie->cfg->ops->deinit(pcie);
++}
++
++static void qcom_pcie_host_post_init(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct qcom_pcie *pcie = to_qcom_pcie(pci);
++
++	/*
++	 * During system suspend, the Qcom RC driver may turn off the
++	 * analog circuitry of PHY and remove controller votes to save
++	 * power. If the link is in L1SS and the endpoint asserts CLKREQ#
++	 * to exit L1SS, the time required to wake the system and restore
++	 * the PHY/REFCLK may exceed the L1SS exit timing (L10_REFCLK_ON +
++	 * T_COMMONMODE), resulting in Link Down (LDn) and a reset of the
++	 * endpoint. Set this flag to indicate this limitation to client
++	 * drivers so that they can avoid relying on device state being
++	 * preserved during system suspend.
++	 */
++	pp->bridge->broken_l1ss_resume = true;
++
++	if (pcie->cfg->ops->host_post_init)
++		pcie->cfg->ops->host_post_init(pcie);
++}
++
++static void qcom_pcie_host_pme_turn_off(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++
++	writel(ELBI_SYS_CTRL_PME_TURNOFF_MSG, pci->elbi_base + ELBI_SYS_CTRL);
++}
++
++static const struct dw_pcie_host_ops qcom_pcie_dw_ops = {
++	.init		= qcom_pcie_host_init,
++	.deinit		= qcom_pcie_host_deinit,
++	.post_init	= qcom_pcie_host_post_init,
++	.pme_turn_off	= qcom_pcie_host_pme_turn_off,
++};
++
++/* Qcom IP rev.: 2.1.0	Synopsys IP rev.: 4.01a */
++static const struct qcom_pcie_ops ops_2_1_0 = {
++	.get_resources = qcom_pcie_get_resources_2_1_0,
++	.init = qcom_pcie_init_2_1_0,
++	.post_init = qcom_pcie_post_init_2_1_0,
++	.deinit = qcom_pcie_deinit_2_1_0,
++	.ltssm_enable = qcom_pcie_2_1_0_ltssm_enable,
++};
++
++/* Qcom IP rev.: 1.0.0	Synopsys IP rev.: 4.11a */
++static const struct qcom_pcie_ops ops_1_0_0 = {
++	.get_resources = qcom_pcie_get_resources_1_0_0,
++	.init = qcom_pcie_init_1_0_0,
++	.post_init = qcom_pcie_post_init_1_0_0,
++	.deinit = qcom_pcie_deinit_1_0_0,
++	.ltssm_enable = qcom_pcie_2_1_0_ltssm_enable,
++};
++
++/* Qcom IP rev.: 2.3.2	Synopsys IP rev.: 4.21a */
++static const struct qcom_pcie_ops ops_2_3_2 = {
++	.get_resources = qcom_pcie_get_resources_2_3_2,
++	.init = qcom_pcie_init_2_3_2,
++	.post_init = qcom_pcie_post_init_2_3_2,
++	.deinit = qcom_pcie_deinit_2_3_2,
++	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
++};
++
++/* Qcom IP rev.: 2.4.0	Synopsys IP rev.: 4.20a */
++static const struct qcom_pcie_ops ops_2_4_0 = {
++	.get_resources = qcom_pcie_get_resources_2_4_0,
++	.init = qcom_pcie_init_2_4_0,
++	.post_init = qcom_pcie_post_init_2_3_2,
++	.deinit = qcom_pcie_deinit_2_4_0,
++	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
++};
++
++/* Qcom IP rev.: 2.3.3	Synopsys IP rev.: 4.30a */
++static const struct qcom_pcie_ops ops_2_3_3 = {
++	.get_resources = qcom_pcie_get_resources_2_3_3,
++	.init = qcom_pcie_init_2_3_3,
++	.post_init = qcom_pcie_post_init_2_3_3,
++	.deinit = qcom_pcie_deinit_2_3_3,
++	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
++};
++
++/* Qcom IP rev.: 2.7.0	Synopsys IP rev.: 4.30a */
++static const struct qcom_pcie_ops ops_2_7_0 = {
++	.get_resources = qcom_pcie_get_resources_2_7_0,
++	.init = qcom_pcie_init_2_7_0,
++	.post_init = qcom_pcie_post_init_2_7_0,
++	.deinit = qcom_pcie_deinit_2_7_0,
++	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
++};
++
++/* Qcom IP rev.: 1.9.0 */
++static const struct qcom_pcie_ops ops_1_9_0 = {
++	.get_resources = qcom_pcie_get_resources_2_7_0,
++	.init = qcom_pcie_init_2_7_0,
++	.post_init = qcom_pcie_post_init_2_7_0,
++	.host_post_init = qcom_pcie_host_post_init_2_7_0,
++	.deinit = qcom_pcie_deinit_2_7_0,
++	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
++	.config_sid = qcom_pcie_config_sid_1_9_0,
++};
++
++/* Qcom IP rev.: 1.21.0  Synopsys IP rev.: 5.60a */
++static const struct qcom_pcie_ops ops_1_21_0 = {
++	.get_resources = qcom_pcie_get_resources_2_7_0,
++	.init = qcom_pcie_init_2_7_0,
++	.post_init = qcom_pcie_post_init_2_7_0,
++	.host_post_init = qcom_pcie_host_post_init_2_7_0,
++	.deinit = qcom_pcie_deinit_2_7_0,
++	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
++};
++
++/* Qcom IP rev.: 2.9.0  Synopsys IP rev.: 5.00a */
++static const struct qcom_pcie_ops ops_2_9_0 = {
++	.get_resources = qcom_pcie_get_resources_2_9_0,
++	.init = qcom_pcie_init_2_9_0,
++	.post_init = qcom_pcie_post_init_2_9_0,
++	.deinit = qcom_pcie_deinit_2_9_0,
++	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
++};
++
++static const struct qcom_pcie_cfg cfg_1_0_0 = {
++	.ops = &ops_1_0_0,
++};
++
++static const struct qcom_pcie_cfg cfg_1_9_0 = {
++	.ops = &ops_1_9_0,
++};
++
++static const struct qcom_pcie_cfg cfg_1_34_0 = {
++	.ops = &ops_1_9_0,
++	.override_no_snoop = true,
++	.no_l0s = true,
++};
++
++static const struct qcom_pcie_cfg cfg_2_1_0 = {
++	.ops = &ops_2_1_0,
++};
++
++static const struct qcom_pcie_cfg cfg_2_3_2 = {
++	.ops = &ops_2_3_2,
++	.no_l0s = true,
++};
++
++static const struct qcom_pcie_cfg cfg_2_3_3 = {
++	.ops = &ops_2_3_3,
++};
++
++static const struct qcom_pcie_cfg cfg_2_4_0 = {
++	.ops = &ops_2_4_0,
++};
++
++static const struct qcom_pcie_cfg cfg_2_7_0 = {
++	.ops = &ops_2_7_0,
++};
++
++static const struct qcom_pcie_cfg cfg_2_9_0 = {
++	.ops = &ops_2_9_0,
++};
++
++static const struct qcom_pcie_cfg cfg_sc8280xp = {
++	.ops = &ops_1_21_0,
++	.no_l0s = true,
++};
++
++static const struct qcom_pcie_cfg cfg_fw_managed = {
++	.firmware_managed = true,
++};
++
++static const struct dw_pcie_ops dw_pcie_ops = {
++	.link_up = qcom_pcie_link_up,
++	.start_link = qcom_pcie_start_link,
++};
++
++static int qcom_pcie_icc_init(struct qcom_pcie *pcie)
++{
++	struct dw_pcie *pci = pcie->pci;
++	int ret;
++
++	pcie->icc_mem = devm_of_icc_get(pci->dev, "pcie-mem");
++	if (IS_ERR(pcie->icc_mem))
++		return PTR_ERR(pcie->icc_mem);
++
++	pcie->icc_cpu = devm_of_icc_get(pci->dev, "cpu-pcie");
++	if (IS_ERR(pcie->icc_cpu))
++		return PTR_ERR(pcie->icc_cpu);
++	/*
++	 * Some Qualcomm platforms require interconnect bandwidth constraints
++	 * to be set before enabling interconnect clocks.
++	 *
++	 * Set an initial peak bandwidth corresponding to single-lane Gen 1
++	 * for the pcie-mem path.
++	 */
++	ret = icc_set_bw(pcie->icc_mem, 0, QCOM_PCIE_LINK_SPEED_TO_BW(1));
++	if (ret) {
++		dev_err(pci->dev, "Failed to set bandwidth for PCIe-MEM interconnect path: %d\n",
++			ret);
++		return ret;
++	}
++
++	/*
++	 * Since the CPU-PCIe path is only used for activities like register
++	 * access of the host controller and endpoint Config/BAR space access,
++	 * HW team has recommended to use a minimal bandwidth of 1KBps just to
++	 * keep the path active.
++	 */
++	ret = icc_set_bw(pcie->icc_cpu, 0, kBps_to_icc(1));
++	if (ret) {
++		dev_err(pci->dev, "Failed to set bandwidth for CPU-PCIe interconnect path: %d\n",
++			ret);
++		icc_set_bw(pcie->icc_mem, 0, 0);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void qcom_pcie_icc_opp_update(struct qcom_pcie *pcie)
++{
++	u32 offset, status, width, speed;
++	struct dw_pcie *pci = pcie->pci;
++	struct dev_pm_opp_key key = {};
++	unsigned long freq_kbps;
++	struct dev_pm_opp *opp;
++	int ret, freq_mbps;
++
++	offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++	status = readw(pci->dbi_base + offset + PCI_EXP_LNKSTA);
++
++	/* Only update constraints if link is up. */
++	if (!(status & PCI_EXP_LNKSTA_DLLLA))
++		return;
++
++	speed = FIELD_GET(PCI_EXP_LNKSTA_CLS, status);
++	width = FIELD_GET(PCI_EXP_LNKSTA_NLW, status);
++
++	if (pcie->icc_mem) {
++		ret = icc_set_bw(pcie->icc_mem, 0,
++				 width * QCOM_PCIE_LINK_SPEED_TO_BW(speed));
++		if (ret) {
++			dev_err(pci->dev, "Failed to set bandwidth for PCIe-MEM interconnect path: %d\n",
++				ret);
++		}
++	} else if (pcie->use_pm_opp) {
++		freq_mbps = pcie_dev_speed_mbps(pcie_get_link_speed(speed));
++		if (freq_mbps < 0)
++			return;
++
++		freq_kbps = freq_mbps * KILO;
++		opp = dev_pm_opp_find_level_exact(pci->dev, speed);
++		if (IS_ERR(opp)) {
++			 /* opp-level is not defined use only frequency */
++			opp = dev_pm_opp_find_freq_exact(pci->dev, freq_kbps * width,
++							 true);
++		} else {
++			/* put opp-level OPP */
++			dev_pm_opp_put(opp);
++
++			key.freq = freq_kbps * width;
++			key.level = speed;
++			key.bw = 0;
++			opp = dev_pm_opp_find_key_exact(pci->dev, &key, true);
++		}
++		if (!IS_ERR(opp)) {
++			ret = dev_pm_opp_set_opp(pci->dev, opp);
++			if (ret)
++				dev_err(pci->dev, "Failed to set OPP for freq (%lu): %d\n",
++					freq_kbps * width, ret);
++			dev_pm_opp_put(opp);
++		}
++	}
++}
++
++static int qcom_pcie_set_max_opp(struct device *dev)
++{
++	unsigned long max_freq = ULONG_MAX;
++	struct dev_pm_opp *opp;
++	int ret;
++
++	opp = dev_pm_opp_find_freq_floor(dev, &max_freq);
++	if (IS_ERR(opp))
++		return PTR_ERR(opp);
++
++	ret = dev_pm_opp_set_opp(dev, opp);
++	dev_pm_opp_put(opp);
++
++	return ret;
++}
++
++static int qcom_pcie_link_transition_count(struct seq_file *s, void *data)
++{
++	struct qcom_pcie *pcie = (struct qcom_pcie *)dev_get_drvdata(s->private);
++
++	seq_printf(s, "L0s transition count: %u\n",
++		   readl_relaxed(pcie->mhi + PARF_DEBUG_CNT_PM_LINKST_IN_L0S));
++
++	seq_printf(s, "L1 transition count: %u\n",
++		   readl_relaxed(pcie->mhi + PARF_DEBUG_CNT_PM_LINKST_IN_L1));
++
++	seq_printf(s, "L1.1 transition count: %u\n",
++		   readl_relaxed(pcie->mhi + PARF_DEBUG_CNT_AUX_CLK_IN_L1SUB_L1));
++
++	seq_printf(s, "L1.2 transition count: %u\n",
++		   readl_relaxed(pcie->mhi + PARF_DEBUG_CNT_AUX_CLK_IN_L1SUB_L2));
++
++	seq_printf(s, "L2 transition count: %u\n",
++		   readl_relaxed(pcie->mhi + PARF_DEBUG_CNT_PM_LINKST_IN_L2));
++
++	return 0;
++}
++
++static void qcom_pcie_init_debugfs(struct qcom_pcie *pcie)
++{
++	struct dw_pcie *pci = pcie->pci;
++	struct device *dev = pci->dev;
++	char *name;
++
++	name = devm_kasprintf(dev, GFP_KERNEL, "%pOFP", dev->of_node);
++	if (!name)
++		return;
++
++	pcie->debugfs = debugfs_create_dir(name, NULL);
++	debugfs_create_devm_seqfile(dev, "link_transition_count", pcie->debugfs,
++				    qcom_pcie_link_transition_count);
++}
++
++static void qcom_pci_free_msi(void *ptr)
++{
++	struct dw_pcie_rp *pp = (struct dw_pcie_rp *)ptr;
++
++	if (pp && pp->use_imsi_rx)
++		dw_pcie_free_msi(pp);
++}
++
++static int qcom_pcie_ecam_host_init(struct pci_config_window *cfg)
++{
++	struct device *dev = cfg->parent;
++	struct dw_pcie_rp *pp;
++	struct dw_pcie *pci;
++	int ret;
++
++	pci = devm_kzalloc(dev, sizeof(*pci), GFP_KERNEL);
++	if (!pci)
++		return -ENOMEM;
++
++	pci->dev = dev;
++	pp = &pci->pp;
++	pci->dbi_base = cfg->win;
++	pp->num_vectors = MSI_DEF_NUM_VECTORS;
++
++	/*
++	 * dw_pcie_msi_host_init() is called directly here, bypassing
++	 * dw_pcie_host_init() where pp->lock is normally initialized.
++	 */
++	raw_spin_lock_init(&pp->lock);
++
++	ret = dw_pcie_msi_host_init(pp);
++	if (ret)
++		return ret;
++
++	pp->use_imsi_rx = true;
++	dw_pcie_msi_init(pp);
++
++	return devm_add_action_or_reset(dev, qcom_pci_free_msi, pp);
++}
++
++static const struct pci_ecam_ops pci_qcom_ecam_ops = {
++	.init		= qcom_pcie_ecam_host_init,
++	.pci_ops	= {
++		.map_bus	= pci_ecam_map_bus,
++		.read		= pci_generic_config_read,
++		.write		= pci_generic_config_write,
++	}
++};
++
++/* Parse PERST# from all nodes in depth first manner starting from @np */
++static int qcom_pcie_parse_perst(struct qcom_pcie *pcie,
++				 struct qcom_pcie_port *port,
++				 struct device_node *np)
++{
++	struct device *dev = pcie->pci->dev;
++	struct qcom_pcie_perst *perst;
++	struct gpio_desc *reset;
++	int ret;
++
++	if (pcie->reset) {
++		dev_warn_once(dev,
++			      "Reusing PERST# from Root Complex node. DT needs to be fixed!\n");
++		reset = pcie->reset;
++		goto skip_perst_parsing;
++	}
++
++	if (!of_find_property(np, "reset-gpios", NULL))
++		goto parse_child_node;
++
++	reset = devm_fwnode_gpiod_get(dev, of_fwnode_handle(np), "reset",
++				      GPIOD_OUT_HIGH, "PERST#");
++	if (IS_ERR(reset)) {
++		/*
++		 * FIXME: GPIOLIB currently supports exclusive GPIO access only.
++		 * Non exclusive access is broken. But shared PERST# requires
++		 * non-exclusive access. So once GPIOLIB properly supports it,
++		 * implement it here.
++		 */
++		if (PTR_ERR(reset) == -EBUSY)
++			dev_err(dev, "Shared PERST# is not supported\n");
++
++		return PTR_ERR(reset);
++	}
++
++skip_perst_parsing:
++	perst = devm_kzalloc(dev, sizeof(*perst), GFP_KERNEL);
++	if (!perst)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&perst->list);
++	perst->desc = reset;
++	list_add_tail(&perst->list, &port->perst);
++
++parse_child_node:
++	for_each_available_child_of_node_scoped(np, child) {
++		ret = qcom_pcie_parse_perst(pcie, port, child);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int qcom_pcie_parse_port(struct qcom_pcie *pcie, struct device_node *node)
++{
++	struct device *dev = pcie->pci->dev;
++	struct qcom_pcie_port *port;
++	struct phy *phy;
++	int ret;
++
++	phy = devm_of_phy_get(dev, node, NULL);
++	if (IS_ERR(phy))
++		return PTR_ERR(phy);
++
++	port = devm_kzalloc(dev, sizeof(*port), GFP_KERNEL);
++	if (!port)
++		return -ENOMEM;
++
++	ret = phy_init(phy);
++	if (ret)
++		return ret;
++
++	INIT_LIST_HEAD(&port->perst);
++
++	ret = qcom_pcie_parse_perst(pcie, port, node);
++	if (ret)
++		return ret;
++
++	/* TODO: Move to DWC core after multi Root Port support is added */
++	of_property_read_u32(node, "t-power-on-us", &port->l1ss_t_power_on);
++
++	port->phy = phy;
++	INIT_LIST_HEAD(&port->list);
++	list_add_tail(&port->list, &pcie->ports);
++
++	return 0;
++}
++
++static int qcom_pcie_parse_ports(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_perst *perst, *tmp_perst;
++	struct qcom_pcie_port *port, *tmp_port;
++	struct device *dev = pcie->pci->dev;
++	int ret = -ENODEV;
++
++	if (of_find_property(dev->of_node, "perst-gpios", NULL)) {
++		pcie->reset = devm_gpiod_get_optional(dev, "perst",
++						      GPIOD_OUT_HIGH);
++		if (IS_ERR(pcie->reset))
++			return PTR_ERR(pcie->reset);
++	}
++
++	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
++		if (!of_node_is_type(of_port, "pci"))
++			continue;
++		ret = qcom_pcie_parse_port(pcie, of_port);
++		if (ret)
++			goto err_port_del;
++	}
++
++	return ret;
++
++err_port_del:
++	list_for_each_entry_safe(port, tmp_port, &pcie->ports, list) {
++		list_for_each_entry_safe(perst, tmp_perst, &port->perst, list)
++			list_del(&perst->list);
++		phy_exit(port->phy);
++		list_del(&port->list);
++	}
++
++	return ret;
++}
++
++static int qcom_pcie_parse_legacy_binding(struct qcom_pcie *pcie)
++{
++	struct device *dev = pcie->pci->dev;
++	struct qcom_pcie_perst *perst;
++	struct qcom_pcie_port *port;
++	struct phy *phy;
++	int ret;
++
++	phy = devm_phy_optional_get(dev, "pciephy");
++	if (IS_ERR(phy))
++		return PTR_ERR(phy);
++
++	ret = phy_init(phy);
++	if (ret)
++		return ret;
++
++	port = devm_kzalloc(dev, sizeof(*port), GFP_KERNEL);
++	if (!port)
++		return -ENOMEM;
++
++	perst = devm_kzalloc(dev, sizeof(*perst), GFP_KERNEL);
++	if (!perst)
++		return -ENOMEM;
++
++	port->phy = phy;
++	INIT_LIST_HEAD(&port->list);
++	list_add_tail(&port->list, &pcie->ports);
++
++	perst->desc = pcie->reset;
++	INIT_LIST_HEAD(&port->perst);
++	INIT_LIST_HEAD(&perst->list);
++	list_add_tail(&perst->list, &port->perst);
++
++	return 0;
++}
++
++static int qcom_pcie_probe(struct platform_device *pdev)
++{
++	struct qcom_pcie_perst *perst, *tmp_perst;
++	struct qcom_pcie_port *port, *tmp_port;
++	const struct qcom_pcie_cfg *pcie_cfg;
++	struct device *dev = &pdev->dev;
++	struct qcom_pcie *pcie;
++	struct dw_pcie_rp *pp;
++	struct resource *res;
++	struct dw_pcie *pci;
++	int ret;
++
++	pcie_cfg = of_device_get_match_data(dev);
++	if (!pcie_cfg) {
++		dev_err(dev, "No platform data\n");
++		return -ENODATA;
++	}
++
++	if (!pcie_cfg->firmware_managed && !pcie_cfg->ops) {
++		dev_err(dev, "No platform ops\n");
++		return -ENODATA;
++	}
++
++	pm_runtime_enable(dev);
++	ret = pm_runtime_get_sync(dev);
++	if (ret < 0)
++		goto err_pm_runtime_put;
++
++	if (pcie_cfg->firmware_managed) {
++		struct pci_host_bridge *bridge;
++		struct pci_config_window *cfg;
++
++		bridge = devm_pci_alloc_host_bridge(dev, 0);
++		if (!bridge) {
++			ret = -ENOMEM;
++			goto err_pm_runtime_put;
++		}
++
++		/* Parse and map our ECAM configuration space area */
++		cfg = pci_host_common_ecam_create(dev, bridge,
++				&pci_qcom_ecam_ops);
++		if (IS_ERR(cfg)) {
++			ret = PTR_ERR(cfg);
++			goto err_pm_runtime_put;
++		}
++
++		bridge->sysdata = cfg;
++		bridge->ops = (struct pci_ops *)&pci_qcom_ecam_ops.pci_ops;
++		bridge->msi_domain = true;
++
++		ret = pci_host_probe(bridge);
++		if (ret)
++			goto err_pm_runtime_put;
++
++		return 0;
++	}
++
++	pcie = devm_kzalloc(dev, sizeof(*pcie), GFP_KERNEL);
++	if (!pcie) {
++		ret = -ENOMEM;
++		goto err_pm_runtime_put;
++	}
++
++	pci = devm_kzalloc(dev, sizeof(*pci), GFP_KERNEL);
++	if (!pci) {
++		ret = -ENOMEM;
++		goto err_pm_runtime_put;
++	}
++
++	INIT_LIST_HEAD(&pcie->ports);
++
++	pci->dev = dev;
++	pci->ops = &dw_pcie_ops;
++	pp = &pci->pp;
++
++	pcie->pci = pci;
++
++	pcie->cfg = pcie_cfg;
++
++	pcie->parf = devm_platform_ioremap_resource_byname(pdev, "parf");
++	if (IS_ERR(pcie->parf)) {
++		ret = PTR_ERR(pcie->parf);
++		goto err_pm_runtime_put;
++	}
++
++	/* MHI region is optional */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mhi");
++	if (res) {
++		pcie->mhi = devm_ioremap_resource(dev, res);
++		if (IS_ERR(pcie->mhi)) {
++			ret = PTR_ERR(pcie->mhi);
++			goto err_pm_runtime_put;
++		}
++	}
++
++	/* OPP table is optional */
++	ret = devm_pm_opp_of_add_table(dev);
++	if (ret && ret != -ENODEV) {
++		dev_err_probe(dev, ret, "Failed to add OPP table\n");
++		goto err_pm_runtime_put;
++	}
++
++	/*
++	 * Before the PCIe link is initialized, vote for highest OPP in the OPP
++	 * table, so that we are voting for maximum voltage corner for the
++	 * link to come up in maximum supported speed. At the end of the
++	 * probe(), OPP will be updated using qcom_pcie_icc_opp_update().
++	 */
++	if (!ret) {
++		ret = qcom_pcie_set_max_opp(dev);
++		if (ret) {
++			dev_err_probe(dev, ret, "Failed to set max OPP\n");
++			goto err_pm_runtime_put;
++		}
++
++		pcie->use_pm_opp = true;
++	} else {
++		/* Skip ICC init if OPP is supported as it is handled by OPP */
++		ret = qcom_pcie_icc_init(pcie);
++		if (ret)
++			goto err_pm_runtime_put;
++	}
++
++	ret = pcie->cfg->ops->get_resources(pcie);
++	if (ret)
++		goto err_pm_runtime_put;
++
++	pp->ops = &qcom_pcie_dw_ops;
++
++	/* PARF_LTSSM is inaccessible after PME_Turn_Off on SM8550. */
++	if (of_device_is_compatible(dev->of_node, "qcom,pcie-sm8550"))
++		pp->skip_l23_ready = true;
++
++	ret = qcom_pcie_parse_ports(pcie);
++	if (ret) {
++		if (ret != -ENODEV) {
++			dev_err_probe(pci->dev, ret,
++				      "Failed to parse Root Port: %d\n", ret);
++			goto err_pm_runtime_put;
++		}
++
++		/*
++		 * In the case of properties not populated in Root Port node,
++		 * fallback to the legacy method of parsing the Host Bridge
++		 * node. This is to maintain DT backwards compatibility.
++		 */
++		ret = qcom_pcie_parse_legacy_binding(pcie);
++		if (ret)
++			goto err_pm_runtime_put;
++	}
++
++	platform_set_drvdata(pdev, pcie);
++
++	ret = dw_pcie_host_init(pp);
++	if (ret) {
++		dev_err_probe(dev, ret, "cannot initialize host\n");
++		goto err_phy_exit;
++	}
++
++	qcom_pcie_icc_opp_update(pcie);
++
++	if (pcie->mhi)
++		qcom_pcie_init_debugfs(pcie);
++
++	return 0;
++
++err_phy_exit:
++	list_for_each_entry_safe(port, tmp_port, &pcie->ports, list) {
++		list_for_each_entry_safe(perst, tmp_perst, &port->perst, list)
++			list_del(&perst->list);
++		phy_exit(port->phy);
++		list_del(&port->list);
++	}
++err_pm_runtime_put:
++	pm_runtime_put(dev);
++	pm_runtime_disable(dev);
++
++	return ret;
++}
++
++/*
++ * Use the DT suspend OPP to retain the PCIe DDR/LLCC sleep-set votes
++ * during s2idle. Suspend-to-RAM tears the link down and keeps dropping
++ * the OPP.
++ */
++static int qcom_pcie_set_suspend_opp(struct qcom_pcie *pcie)
++{
++	struct device *dev = pcie->pci->dev;
++	struct dev_pm_opp *opp;
++	unsigned long freq;
++	int ret;
++
++	if (pm_suspend_target_state == PM_SUSPEND_MEM)
++		return dev_pm_opp_set_opp(dev, NULL);
++
++	freq = dev_pm_opp_get_suspend_opp_freq(dev);
++	if (!freq)
++		return dev_pm_opp_set_opp(dev, NULL);
++
++	opp = dev_pm_opp_find_freq_exact(dev, freq, true);
++	if (IS_ERR(opp))
++		return PTR_ERR(opp);
++
++	ret = dev_pm_opp_set_opp(dev, opp);
++	dev_pm_opp_put(opp);
++
++	return ret;
++}
++
++static int qcom_pcie_suspend_noirq(struct device *dev)
++{
++	struct qcom_pcie *pcie;
++	int ret = 0;
++
++	pcie = dev_get_drvdata(dev);
++	if (!pcie)
++		return 0;
++
++	ret = dw_pcie_suspend_noirq(pcie->pci);
++	if (ret)
++		return ret;
++
++	if (pcie->pci->suspended) {
++		ret = icc_disable(pcie->icc_mem);
++		if (ret)
++			dev_err(dev, "Failed to disable PCIe-MEM interconnect path: %d\n", ret);
++
++		ret = icc_disable(pcie->icc_cpu);
++		if (ret)
++			dev_err(dev, "Failed to disable CPU-PCIe interconnect path: %d\n", ret);
++
++		if (pcie->use_pm_opp) {
++			ret = qcom_pcie_set_suspend_opp(pcie);
++			if (ret)
++				dev_err(dev, "Failed to set suspend OPP: %d\n", ret);
++		}
++	} else {
++		/*
++		 * Set minimum bandwidth required to keep data path
++		 * functional during suspend.
++		 */
++		if (pcie->icc_mem) {
++			ret = icc_set_bw(pcie->icc_mem, 0, kBps_to_icc(1));
++			if (ret) {
++				dev_err(dev,
++					"Failed to set bandwidth for PCIe-MEM interconnect path: %d\n",
++					ret);
++				return ret;
++			}
++		}
++
++		/*
++		 * Only disable CPU-PCIe interconnect path if the suspend
++		 * is non-S2RAM.  On some platforms, DBI access can happen
++		 * very late during S2RAM and a non-active CPU-PCIe
++		 * interconnect path may lead to NoC error.
++		 */
++		if (pm_suspend_target_state != PM_SUSPEND_MEM) {
++			ret = icc_disable(pcie->icc_cpu);
++			if (ret)
++				dev_err(dev, "Failed to disable CPU-PCIe interconnect path: %d\n",
++					ret);
++
++			if (pcie->use_pm_opp) {
++				ret = qcom_pcie_set_suspend_opp(pcie);
++				if (ret)
++					dev_err(dev, "Failed to set suspend OPP: %d\n",
++						ret);
++			}
++		}
++	}
++	return ret;
++}
++
++static int qcom_pcie_resume_noirq(struct device *dev)
++{
++	struct qcom_pcie *pcie;
++	int ret;
++
++	pcie = dev_get_drvdata(dev);
++	if (!pcie)
++		return 0;
++
++	if (pcie->pci->suspended) {
++		if (pcie->use_pm_opp) {
++			ret = qcom_pcie_set_max_opp(dev);
++			if (ret) {
++				dev_err(dev, "Failed to set max OPP: %d\n", ret);
++				return ret;
++			}
++		}
++
++		ret = icc_enable(pcie->icc_cpu);
++		if (ret) {
++			dev_err(dev, "Failed to enable CPU-PCIe interconnect path: %d\n", ret);
++			return ret;
++		}
++
++		ret = icc_enable(pcie->icc_mem);
++		if (ret) {
++			dev_err(dev, "Failed to enable PCIe-MEM interconnect path: %d\n", ret);
++			goto disable_icc_cpu;
++		}
++
++		/*
++		 * Ignore -ENODEV & -EIO here since it is expected when no
++		 * endpoint is connected to the PCIe link.
++		 */
++		ret = dw_pcie_resume_noirq(pcie->pci);
++		if (ret && ret != -ENODEV && ret != -EIO)
++			goto disable_icc_mem;
++	} else {
++		if (pm_suspend_target_state != PM_SUSPEND_MEM) {
++			if (pcie->use_pm_opp) {
++				ret = qcom_pcie_set_max_opp(dev);
++				if (ret) {
++					dev_err(dev, "Failed to set max OPP: %d\n", ret);
++					return ret;
++				}
++			}
++
++			ret = icc_enable(pcie->icc_cpu);
++			if (ret) {
++				dev_err(dev, "Failed to enable CPU-PCIe interconnect path: %d\n",
++					ret);
++				return ret;
++			}
++		}
++	}
++
++	qcom_pcie_icc_opp_update(pcie);
++
++	return 0;
++disable_icc_mem:
++	icc_disable(pcie->icc_mem);
++disable_icc_cpu:
++	icc_disable(pcie->icc_cpu);
++
++	return ret;
++}
++
++static const struct of_device_id qcom_pcie_match[] = {
++	{ .compatible = "qcom,pcie-apq8064", .data = &cfg_2_1_0 },
++	{ .compatible = "qcom,pcie-apq8084", .data = &cfg_1_0_0 },
++	{ .compatible = "qcom,pcie-ipq4019", .data = &cfg_2_4_0 },
++	{ .compatible = "qcom,pcie-ipq5018", .data = &cfg_2_9_0 },
++	{ .compatible = "qcom,pcie-ipq6018", .data = &cfg_2_9_0 },
++	{ .compatible = "qcom,pcie-ipq8064", .data = &cfg_2_1_0 },
++	{ .compatible = "qcom,pcie-ipq8064-v2", .data = &cfg_2_1_0 },
++	{ .compatible = "qcom,pcie-ipq8074", .data = &cfg_2_3_3 },
++	{ .compatible = "qcom,pcie-ipq8074-gen3", .data = &cfg_2_9_0 },
++	{ .compatible = "qcom,pcie-ipq9574", .data = &cfg_2_9_0 },
++	{ .compatible = "qcom,pcie-msm8996", .data = &cfg_2_3_2 },
++	{ .compatible = "qcom,pcie-qcs404", .data = &cfg_2_4_0 },
++	{ .compatible = "qcom,pcie-sa8255p", .data = &cfg_fw_managed },
++	{ .compatible = "qcom,pcie-sa8540p", .data = &cfg_sc8280xp },
++	{ .compatible = "qcom,pcie-sa8775p", .data = &cfg_1_34_0},
++	{ .compatible = "qcom,pcie-sc7280", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-sc8180x", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-sc8280xp", .data = &cfg_sc8280xp },
++	{ .compatible = "qcom,pcie-sdm845", .data = &cfg_2_7_0 },
++	{ .compatible = "qcom,pcie-sdx55", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-sm8150", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-sm8250", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-sm8350", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-sm8450-pcie0", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-sm8450-pcie1", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-sm8550", .data = &cfg_1_9_0 },
++	{ .compatible = "qcom,pcie-x1e80100", .data = &cfg_sc8280xp },
++	{ }
++};
++
++static void qcom_fixup_class(struct pci_dev *dev)
++{
++	dev->class = PCI_CLASS_BRIDGE_PCI_NORMAL;
++}
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0101, qcom_fixup_class);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0104, qcom_fixup_class);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0106, qcom_fixup_class);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0107, qcom_fixup_class);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x0302, qcom_fixup_class);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1000, qcom_fixup_class);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_QCOM, 0x1001, qcom_fixup_class);
++
++static const struct dev_pm_ops qcom_pcie_pm_ops = {
++	NOIRQ_SYSTEM_SLEEP_PM_OPS(qcom_pcie_suspend_noirq, qcom_pcie_resume_noirq)
++};
++
++static struct platform_driver qcom_pcie_driver = {
++	.probe = qcom_pcie_probe,
++	.driver = {
++		.name = "qcom-pcie",
++		.suppress_bind_attrs = true,
++		.of_match_table = qcom_pcie_match,
++		.pm = &qcom_pcie_pm_ops,
++		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++	},
++};
++builtin_platform_driver(qcom_pcie_driver);
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c.rej b/drivers/pci/controller/dwc/pcie-qcom.c.rej
+new file mode 100644
+index 0000000..0e0c46a
+--- /dev/null
++++ b/drivers/pci/controller/dwc/pcie-qcom.c.rej
+@@ -0,0 +1,189 @@
++@@ -287,6 +286,7 @@
++ 	const struct qcom_pcie_cfg *cfg;
++ 	struct dentry *debugfs;
++ 	struct list_head ports;
+++	bool suspended;
++ 	bool use_pm_opp;
++ };
++ 
++@@ -1371,14 +1366,11 @@
++ 
++ 	qcom_pcie_perst_assert(pcie);
++ 
++-	if (!pci->pp.skip_pwrctrl_off) {
++-		/*
++-		 * No need to destroy pwrctrl devices as this function only gets called
++-		 * during system suspend as of now.
++-		 */
++-		pci_pwrctrl_power_off_devices(pci->dev);
++-	}
++-
+++	/*
+++	 * No need to destroy pwrctrl devices as this function only gets called
+++	 * during system suspend as of now.
+++	 */
+++	pci_pwrctrl_power_off_devices(pci->dev);
++ 	qcom_pcie_phy_power_off(pcie);
++ 	pcie->cfg->ops->deinit(pcie);
++ }
++@@ -2140,51 +2124,53 @@
++ 	if (!pcie)
++ 		return 0;
++ 
++-	ret = dw_pcie_suspend_noirq(pcie->pci);
++-	if (ret)
++-		return ret;
+++	/*
+++	 * Set minimum bandwidth required to keep data path functional during
+++	 * suspend.
+++	 */
+++	if (pcie->icc_mem) {
+++		ret = icc_set_bw(pcie->icc_mem, 0, kBps_to_icc(1));
+++		if (ret) {
+++			dev_err(dev,
+++				"Failed to set bandwidth for PCIe-MEM interconnect path: %d\n",
+++				ret);
+++			return ret;
+++		}
+++	}
++ 
++-	if (pcie->pci->suspended) {
++-		ret = icc_disable(pcie->icc_mem);
++-		if (ret)
++-			dev_err(dev, "Failed to disable PCIe-MEM interconnect path: %d\n", ret);
+++	/*
+++	 * Turn OFF the resources only for controllers without active PCIe
+++	 * devices. For controllers with active devices, the resources are kept
+++	 * ON and the link is expected to be in L0/L1 (sub)states.
+++	 *
+++	 * Turning OFF the resources for controllers with active PCIe devices
+++	 * will trigger access violation during the end of the suspend cycle,
+++	 * as kernel tries to access the PCIe devices config space for masking
+++	 * MSIs.
+++	 *
+++	 * Also, it is not desirable to put the link into L2/L3 state as that
+++	 * implies VDD supply will be removed and the devices may go into
+++	 * powerdown state. This will affect the lifetime of the storage devices
+++	 * like NVMe.
+++	 */
+++	if (!dw_pcie_link_up(pcie->pci)) {
+++		qcom_pcie_host_deinit(&pcie->pci->pp);
+++		pcie->suspended = true;
+++	}
++ 
+++	/*
+++	 * Only disable CPU-PCIe interconnect path if the suspend is non-S2RAM.
+++	 * Because on some platforms, DBI access can happen very late during the
+++	 * S2RAM and a non-active CPU-PCIe interconnect path may lead to NoC
+++	 * error.
+++	 */
+++	if (pm_suspend_target_state != PM_SUSPEND_MEM) {
++ 		ret = icc_disable(pcie->icc_cpu);
++ 		if (ret)
++ 			dev_err(dev, "Failed to disable CPU-PCIe interconnect path: %d\n", ret);
++ 
++ 		if (pcie->use_pm_opp)
++ 			dev_pm_opp_set_opp(pcie->pci->dev, NULL);
++-	} else {
++-		/*
++-		 * Set minimum bandwidth required to keep data path functional during
++-		 * suspend.
++-		 */
++-		if (pcie->icc_mem) {
++-			ret = icc_set_bw(pcie->icc_mem, 0, kBps_to_icc(1));
++-			if (ret) {
++-				dev_err(dev,
++-					"Failed to set bandwidth for PCIe-MEM interconnect path: %d\n",
++-					ret);
++-				return ret;
++-			}
++-		}
++-
++-		/*
++-		 * Only disable CPU-PCIe interconnect path if the suspend is non-S2RAM.
++-		 * Because on some platforms, DBI access can happen very late during the
++-		 * S2RAM and a non-active CPU-PCIe interconnect path may lead to NoC
++-		 * error.
++-		 */
++-		if (pm_suspend_target_state != PM_SUSPEND_MEM) {
++-			ret = icc_disable(pcie->icc_cpu);
++-			if (ret)
++-				dev_err(dev, "Failed to disable CPU-PCIe interconnect path: %d\n",
++-					ret);
++-
++-			if (pcie->use_pm_opp)
++-				dev_pm_opp_set_opp(pcie->pci->dev, NULL);
++-		}
++ 	}
++ 	return ret;
++ }
++@@ -2198,54 +2184,33 @@
++ 	if (!pcie)
++ 		return 0;
++ 
++-	if (pcie->pci->suspended) {
+++	if (pm_suspend_target_state != PM_SUSPEND_MEM) {
+++		if (pcie->use_pm_opp) {
+++			ret = qcom_pcie_set_max_opp(dev);
+++			if (ret) {
+++				dev_err(dev, "Failed to set max OPP: %d\n", ret);
+++				return ret;
+++			}
+++		}
+++
++ 		ret = icc_enable(pcie->icc_cpu);
++ 		if (ret) {
++ 			dev_err(dev, "Failed to enable CPU-PCIe interconnect path: %d\n", ret);
++ 			return ret;
++ 		}
+++	}
++ 
++-		ret = icc_enable(pcie->icc_mem);
++-		if (ret) {
++-			dev_err(dev, "Failed to enable PCIe-MEM interconnect path: %d\n", ret);
++-			goto disable_icc_cpu;
++-		}
+++	if (pcie->suspended) {
+++		ret = qcom_pcie_host_init(&pcie->pci->pp);
+++		if (ret)
+++			return ret;
++ 
++-		/*
++-		 * Ignore -ENODEV & -EIO here since it is expected when no endpoint is
++-		 * connected to the PCIe link.
++-		 */
++-		ret = dw_pcie_resume_noirq(pcie->pci);
++-		if (ret && ret != -ENODEV && ret != -EIO)
++-			goto disable_icc_mem;
++-	} else {
++-		if (pm_suspend_target_state != PM_SUSPEND_MEM) {
++-			if (pcie->use_pm_opp) {
++-				ret = qcom_pcie_set_max_opp(dev);
++-				if (ret) {
++-					dev_err(dev, "Failed to set max OPP: %d\n", ret);
++-					return ret;
++-				}
++-			}
++-
++-			ret = icc_enable(pcie->icc_cpu);
++-			if (ret) {
++-				dev_err(dev, "Failed to enable CPU-PCIe interconnect path: %d\n",
++-					ret);
++-				return ret;
++-			}
++-		}
+++		pcie->suspended = false;
++ 	}
++ 
++ 	qcom_pcie_icc_opp_update(pcie);
++ 
++ 	return 0;
++-disable_icc_mem:
++-	icc_disable(pcie->icc_mem);
++-disable_icc_cpu:
++-	icc_disable(pcie->icc_cpu);
++-
++-	return ret;
++ }
++ 
++ static const struct of_device_id qcom_pcie_match[] = {
+diff --git a/drivers/pci/controller/pci-host-common.c b/drivers/pci/controller/pci-host-common.c
+index 2ce6f4b..45114e8 100644
+--- a/drivers/pci/controller/pci-host-common.c
++++ b/drivers/pci/controller/pci-host-common.c
+@@ -190,6 +190,9 @@ EXPORT_SYMBOL_GPL(pci_host_common_parse_ports);
+ #define PCI_HOST_PME_D3COLD_CAPABLE    BIT(1)
+ 
+ 
++#define PCI_HOST_D3COLD_ALLOWED        BIT(0)
++#define PCI_HOST_PME_D3COLD_CAPABLE    BIT(1)
++
+ static void gen_pci_unmap_cfg(void *ptr)
+ {
+ 	pci_ecam_free((struct pci_config_window *)ptr);
+@@ -276,6 +279,74 @@ void pci_host_common_remove(struct platform_device *pdev)
+ {
+ 	struct pci_host_bridge *bridge = platform_get_drvdata(pdev);
+ 
++static int __pci_host_common_d3cold_possible(struct pci_dev *pdev, void *userdata)
++{
++	u32 *flags = userdata;
++	int type;
++
++	/* Ignore conventional PCI devices */
++	if (!pci_is_pcie(pdev))
++		return 0;
++
++	type = pci_pcie_type(pdev);
++	if (type != PCI_EXP_TYPE_ENDPOINT &&
++	    type != PCI_EXP_TYPE_LEG_END &&
++	    type != PCI_EXP_TYPE_RC_END)
++		return 0;
++
++	if (!pdev->dev.driver && !pci_is_enabled(pdev))
++		return 0;
++
++	if (pdev->current_state != PCI_D3hot)
++		goto exit;
++
++	if (device_may_wakeup(&pdev->dev)) {
++		if (!pci_pme_capable(pdev, PCI_D3cold))
++			goto exit;
++		else
++			*flags |= PCI_HOST_PME_D3COLD_CAPABLE;
++	}
++
++	return 0;
++
++exit:
++	*flags &= ~PCI_HOST_D3COLD_ALLOWED;
++
++	return -EOPNOTSUPP;
++}
++
++/**
++ * pci_host_common_d3cold_possible - Determine whether the host bridge can transition the
++ *				     devices into D3Cold.
++ *
++ * @bridge: PCI host bridge to check
++ * @pme_capable: Pointer to update if there is any device which is capable of generating
++ *		 PME from D3cold.
++ *
++ * Walk downstream PCIe endpoint devices and determine whether the host bridge
++ * is permitted to transition the devices into D3cold.
++ *
++ * Devices under host bridge can enter D3cold only if all active PCIe endpoints are in
++ * PCI_D3hot and any wakeup-enabled endpoint is capable of generating PME from D3cold.
++ * Inactive endpoints are ignored.
++ *
++ * The @pme_capable output allows PCIe controller drivers to apply
++ * platform-specific handling to preserve wakeup functionality.
++ *
++ * Return: %true if the host bridge may enter D3cold, otherwise %false.
++ */
++bool pci_host_common_d3cold_possible(struct pci_host_bridge *bridge, bool *pme_capable)
++{
++	u32 flags = PCI_HOST_D3COLD_ALLOWED;
++
++	pci_walk_bus(bridge->bus, __pci_host_common_d3cold_possible, &flags);
++
++	*pme_capable = !!(flags & PCI_HOST_PME_D3COLD_CAPABLE);
++
++	return !!(flags & PCI_HOST_D3COLD_ALLOWED);
++}
++EXPORT_SYMBOL_GPL(pci_host_common_d3cold_possible);
++
+ 	pci_lock_rescan_remove();
+ 	pci_stop_root_bus(bridge->bus);
+ 	pci_remove_root_bus(bridge->bus);
+diff --git a/drivers/pci/controller/pci-host-common.c.orig b/drivers/pci/controller/pci-host-common.c.orig
+new file mode 100644
+index 0000000..2ce6f4b
+--- /dev/null
++++ b/drivers/pci/controller/pci-host-common.c.orig
+@@ -0,0 +1,346 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Common library for PCI host controller drivers
++ *
++ * Copyright (C) 2014 ARM Limited
++ *
++ * Author: Will Deacon <will.deacon@arm.com>
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/gpio/consumer.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_pci.h>
++#include <linux/pci-ecam.h>
++#include <linux/platform_device.h>
++
++#include "pci-host-common.h"
++
++/**
++ * pci_host_common_delete_ports - Cleanup function for port list
++ * @data: Pointer to the port list head
++ */
++void pci_host_common_delete_ports(void *data)
++{
++	struct list_head *ports = data;
++	struct pci_host_perst *perst, *tmp_perst;
++	struct pci_host_port *port, *tmp_port;
++
++	list_for_each_entry_safe(port, tmp_port, ports, list) {
++		list_for_each_entry_safe(perst, tmp_perst, &port->perst, list)
++			list_del(&perst->list);
++		list_del(&port->list);
++	}
++}
++EXPORT_SYMBOL_GPL(pci_host_common_delete_ports);
++
++/**
++ * pci_host_common_parse_perst - Parse PERST# from all nodes, depth first
++ * @dev: Device pointer
++ * @port: PCI host port
++ * @np: Device tree node to start parsing from
++ *
++ * Recursively parse PERST# GPIO from all PCIe bridge nodes starting from
++ * @np in a depth-first manner.
++ *
++ * Return: 0 on success, negative error code on failure.
++ */
++static int pci_host_common_parse_perst(struct device *dev,
++				       struct pci_host_port *port,
++				       struct device_node *np)
++{
++	struct pci_host_perst *perst;
++	struct gpio_desc *reset;
++	int ret;
++
++	if (!of_property_present(np, "reset-gpios"))
++		goto parse_child_node;
++
++	reset = devm_fwnode_gpiod_get(dev, of_fwnode_handle(np), "reset",
++				      GPIOD_ASIS, "PERST#");
++	if (IS_ERR(reset)) {
++		/*
++		 * FIXME: GPIOLIB currently supports exclusive GPIO access only.
++		 * Non exclusive access is broken. But shared PERST# requires
++		 * non-exclusive access. So once GPIOLIB properly supports it,
++		 * implement it here.
++		 */
++		if (PTR_ERR(reset) == -EBUSY)
++			dev_err(dev, "Shared PERST# is not supported\n");
++
++		return PTR_ERR(reset);
++	}
++
++	perst = devm_kzalloc(dev, sizeof(*perst), GFP_KERNEL);
++	if (!perst)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&perst->list);
++	perst->desc = reset;
++	list_add_tail(&perst->list, &port->perst);
++
++parse_child_node:
++	for_each_available_child_of_node_scoped(np, child) {
++		ret = pci_host_common_parse_perst(dev, port, child);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * pci_host_common_parse_port - Parse a single Root Port node
++ * @dev: Device pointer
++ * @bridge: PCI host bridge
++ * @node: Device tree node of the Root Port
++ *
++ * Parse Root Port properties from the device tree.  Currently it only
++ * handles the PERST# GPIO (including PERST# GPIOs from all PCIe bridge
++ * nodes under this Root Port), which is optional.
++ *
++ * NOTE: This helper fetches resources (like PERST# GPIO) optionally.  If a
++ * controller driver has a hard dependency on certain resources (PHY,
++ * clocks, regulators, etc.), those resources MUST be modeled correctly in
++ * the DT binding and validated in DTS. This helper cannot enforce such
++ * dependencies and the driver may fail to operate if required resources
++ * are missing.
++ *
++ * Return: 0 on success, -ENODEV if PERST# found in RC node (legacy binding
++ * should be used), Other negative error codes on failure.
++ */
++static int pci_host_common_parse_port(struct device *dev,
++				      struct pci_host_bridge *bridge,
++				      struct device_node *node)
++{
++	struct pci_host_port *port;
++	int ret;
++
++	port = devm_kzalloc(dev, sizeof(*port), GFP_KERNEL);
++	if (!port)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&port->perst);
++
++	ret = pci_host_common_parse_perst(dev, port, node);
++	if (ret)
++		return ret;
++
++	/*
++	 * 1. PERST# found in RP or its child nodes - list is not empty,
++	 *    continue
++	 *
++	 * 2. PERST# not found in RP/children, but found in RC node -
++	 *    return -ENODEV to fallback legacy binding
++	 *
++	 * 3. PERST# not found anywhere - list is empty, continue (optional
++	 *    PERST#)
++	 */
++	if (list_empty(&port->perst)) {
++		if (of_property_present(dev->of_node, "reset-gpios") ||
++		    of_property_present(dev->of_node, "reset-gpio"))
++			return -ENODEV;
++	}
++
++	INIT_LIST_HEAD(&port->list);
++	list_add_tail(&port->list, &bridge->ports);
++
++	return 0;
++}
++
++/**
++ * pci_host_common_parse_ports - Parse Root Port nodes from device tree
++ * @dev: Device pointer
++ * @bridge: PCI host bridge
++ *
++ * Iterate through child nodes of the host bridge and parse Root Port
++ * properties (currently only reset GPIOs).
++ *
++ * Return: 0 on success, -ENODEV if no ports found or PERST# found in RC
++ * node (legacy binding should be used), Other negative error codes on
++ * failure.
++ */
++int pci_host_common_parse_ports(struct device *dev, struct pci_host_bridge *bridge)
++{
++	int ret = -ENODEV;
++
++	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
++		if (!of_node_is_type(of_port, "pci"))
++			continue;
++		ret = pci_host_common_parse_port(dev, bridge, of_port);
++		if (ret)
++			goto err_cleanup;
++	}
++
++	if (ret)
++		return ret;
++
++	return devm_add_action_or_reset(dev, pci_host_common_delete_ports,
++					&bridge->ports);
++
++err_cleanup:
++	pci_host_common_delete_ports(&bridge->ports);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(pci_host_common_parse_ports);
++
++#define PCI_HOST_D3COLD_ALLOWED        BIT(0)
++#define PCI_HOST_PME_D3COLD_CAPABLE    BIT(1)
++
++
++static void gen_pci_unmap_cfg(void *ptr)
++{
++	pci_ecam_free((struct pci_config_window *)ptr);
++}
++
++struct pci_config_window *pci_host_common_ecam_create(struct device *dev,
++		struct pci_host_bridge *bridge, const struct pci_ecam_ops *ops)
++{
++	int err;
++	struct resource cfgres;
++	struct resource_entry *bus;
++	struct pci_config_window *cfg;
++
++	err = of_address_to_resource(dev->of_node, 0, &cfgres);
++	if (err) {
++		dev_err(dev, "missing or malformed \"reg\" property\n");
++		return ERR_PTR(err);
++	}
++
++	bus = resource_list_first_type(&bridge->windows, IORESOURCE_BUS);
++	if (!bus)
++		return ERR_PTR(-ENODEV);
++
++	cfg = pci_ecam_create(dev, &cfgres, bus->res, ops);
++	if (IS_ERR(cfg))
++		return cfg;
++
++	err = devm_add_action_or_reset(dev, gen_pci_unmap_cfg, cfg);
++	if (err)
++		return ERR_PTR(err);
++
++	return cfg;
++}
++EXPORT_SYMBOL_GPL(pci_host_common_ecam_create);
++
++int pci_host_common_init(struct platform_device *pdev,
++			 struct pci_host_bridge *bridge,
++			 const struct pci_ecam_ops *ops)
++{
++	struct device *dev = &pdev->dev;
++	struct pci_config_window *cfg;
++
++	of_pci_check_probe_only();
++
++	platform_set_drvdata(pdev, bridge);
++
++	/* Parse and map our Configuration Space windows */
++	cfg = pci_host_common_ecam_create(dev, bridge, ops);
++	if (IS_ERR(cfg))
++		return PTR_ERR(cfg);
++
++	/* Do not reassign bus numbers if probe only */
++	if (!pci_has_flag(PCI_PROBE_ONLY))
++		pci_add_flags(PCI_REASSIGN_ALL_BUS);
++
++	bridge->sysdata = cfg;
++	bridge->ops = (struct pci_ops *)&ops->pci_ops;
++	bridge->enable_device = ops->enable_device;
++	bridge->disable_device = ops->disable_device;
++	bridge->msi_domain = true;
++
++	return pci_host_probe(bridge);
++}
++EXPORT_SYMBOL_GPL(pci_host_common_init);
++
++int pci_host_common_probe(struct platform_device *pdev)
++{
++	const struct pci_ecam_ops *ops;
++	struct pci_host_bridge *bridge;
++
++	ops = of_device_get_match_data(&pdev->dev);
++	if (!ops)
++		return -ENODEV;
++
++	bridge = devm_pci_alloc_host_bridge(&pdev->dev, 0);
++	if (!bridge)
++		return -ENOMEM;
++
++	return pci_host_common_init(pdev, bridge, ops);
++}
++EXPORT_SYMBOL_GPL(pci_host_common_probe);
++
++void pci_host_common_remove(struct platform_device *pdev)
++{
++	struct pci_host_bridge *bridge = platform_get_drvdata(pdev);
++
++	pci_lock_rescan_remove();
++	pci_stop_root_bus(bridge->bus);
++	pci_remove_root_bus(bridge->bus);
++	pci_unlock_rescan_remove();
++}
++EXPORT_SYMBOL_GPL(pci_host_common_remove);
++
++static int __pci_host_common_d3cold_possible(struct pci_dev *pdev,
++					     void *userdata)
++{
++	u32 *flags = userdata;
++
++	if (!pdev->dev.driver && !pci_is_enabled(pdev))
++		return 0;
++
++	if (pdev->current_state != PCI_D3hot)
++		goto exit;
++
++	if (device_may_wakeup(&pdev->dev)) {
++		if (!pci_pme_capable(pdev, PCI_D3cold))
++			goto exit;
++		else
++			*flags |= PCI_HOST_PME_D3COLD_CAPABLE;
++	}
++
++	return 0;
++
++exit:
++	*flags &= ~PCI_HOST_D3COLD_ALLOWED;
++
++	return -EOPNOTSUPP;
++}
++
++/**
++ * pci_host_common_d3cold_possible - Determine whether the host bridge can
++ *				     transition the devices into D3cold.
++ *
++ * @bridge: PCI host bridge to check
++ * @pme_capable: Pointer to update if there is any device capable of generating
++ *		 PME from D3cold.
++ *
++ * Walk downstream PCIe endpoint devices and determine whether the host bridge
++ * is permitted to transition the devices into D3cold.
++ *
++ * Devices under host bridge can enter D3cold only if all active PCIe
++ * endpoints are in PCI_D3hot and any wakeup-enabled endpoint is capable of
++ * generating PME from D3cold.  Inactive endpoints are ignored.
++ *
++ * The @pme_capable output allows PCIe controller drivers to apply
++ * platform-specific handling to preserve wakeup functionality.
++ *
++ * Return: %true if the host bridge may enter D3cold, otherwise %false.
++ */
++bool pci_host_common_d3cold_possible(struct pci_host_bridge *bridge,
++				     bool *pme_capable)
++{
++	u32 flags = PCI_HOST_D3COLD_ALLOWED;
++
++	pci_walk_bus(bridge->bus, __pci_host_common_d3cold_possible, &flags);
++
++	*pme_capable = !!(flags & PCI_HOST_PME_D3COLD_CAPABLE);
++
++	return !!(flags & PCI_HOST_D3COLD_ALLOWED);
++}
++EXPORT_SYMBOL_GPL(pci_host_common_d3cold_possible);
++
++MODULE_DESCRIPTION("Common library for PCI host controller drivers");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/pci/controller/pci-host-common.h b/drivers/pci/controller/pci-host-common.h
+index 9f0f36a..6e822a4 100644
+--- a/drivers/pci/controller/pci-host-common.h
++++ b/drivers/pci/controller/pci-host-common.h
+@@ -52,6 +52,8 @@ void pci_host_common_remove(struct platform_device *pdev);
+ struct pci_config_window *pci_host_common_ecam_create(struct device *dev,
+ 	struct pci_host_bridge *bridge, const struct pci_ecam_ops *ops);
+ 
++bool pci_host_common_d3cold_possible(struct pci_host_bridge *bridge, bool *pme_capable);
++
+ bool pci_host_common_d3cold_possible(struct pci_host_bridge *bridge,
+ 				     bool *pme_capable);
+ 
+diff --git a/drivers/pci/controller/pci-host-common.h.orig b/drivers/pci/controller/pci-host-common.h.orig
+new file mode 100644
+index 0000000..9f0f36a
+--- /dev/null
++++ b/drivers/pci/controller/pci-host-common.h.orig
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Common library for PCI host controller drivers
++ *
++ * Copyright (C) 2014 ARM Limited
++ *
++ * Author: Will Deacon <will.deacon@arm.com>
++ */
++
++#ifndef _PCI_HOST_COMMON_H
++#define _PCI_HOST_COMMON_H
++
++#include <linux/delay.h>
++#include "../pci.h"
++
++struct pci_ecam_ops;
++
++/**
++ * struct pci_host_perst - PERST# GPIO descriptor
++ * @list: List node for linking multiple PERST# GPIOs
++ * @desc: GPIO descriptor for PERST# signal
++ *
++ * This structure holds a single PERST# GPIO descriptor.
++ */
++struct pci_host_perst {
++	struct list_head	list;
++	struct gpio_desc	*desc;
++};
++
++/**
++ * struct pci_host_port - Generic Root Port properties
++ * @list: List node for linking multiple ports
++ * @perst: List of PERST# GPIO descriptors for this port and its children
++ *
++ * This structure contains common properties that can be parsed from
++ * Root Port device tree nodes.
++ */
++struct pci_host_port {
++	struct list_head	list;
++	struct list_head	perst;
++};
++
++void pci_host_common_delete_ports(void *data);
++int pci_host_common_parse_ports(struct device *dev,
++				struct pci_host_bridge *bridge);
++int pci_host_common_probe(struct platform_device *pdev);
++int pci_host_common_init(struct platform_device *pdev,
++			 struct pci_host_bridge *bridge,
++			 const struct pci_ecam_ops *ops);
++void pci_host_common_remove(struct platform_device *pdev);
++
++struct pci_config_window *pci_host_common_ecam_create(struct device *dev,
++	struct pci_host_bridge *bridge, const struct pci_ecam_ops *ops);
++
++bool pci_host_common_d3cold_possible(struct pci_host_bridge *bridge,
++				     bool *pme_capable);
++
++/**
++ * pci_host_common_link_train_delay - Wait 100 ms if link speed > 5 GT/s
++ * @max_link_speed: the maximum link speed (2 = 5.0 GT/s, 3 = 8.0 GT/s, ...)
++ *
++ * Must be called after Link training completes and before the first
++ * Configuration Request is sent.
++ */
++static inline void pci_host_common_link_train_delay(int max_link_speed)
++{
++	if (max_link_speed > 2)
++		msleep(PCIE_RESET_CONFIG_WAIT_MS);
++}
++
++#endif
