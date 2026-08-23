@@ -590,7 +590,7 @@ Port des patches de jaewun (source : shuuri-labs/pocknix-os, validés à
 - DT : `dts/qcs8550-ayn-common.dtsi.patch` étendu — vreg_bob2 off-in-suspend, vreg_l15b_1p8 on-in-suspend+LPM
 - `patches/0564-tty-serial-qcom-geni-mask-non-console-irq-on-suspend.patch` — masque IRQ geni non-console au suspend
 - `patches/0570-scsi-ufs-qcom-deep-suspend-set.patch` — set UFS plié rebasé v7.2 (drain relink OOB avec fix manuel hunk 13, hibern8-exit clk, auto-hibern8 collision, mphy park, rx-linecfg ; le phy était déjà partiellement upstream en 7.2)
-- `patches/0580-pci-d3cold-set.patch` — set PCIe d3cold plié (helper eligibility, get_ltssm PARF_LTSSM, PHY PARF_PHY_CTRL down, dwc eligibility, qcom d3cold) — applique sans rejet sur v7.2+0512+0513
+- `patches/0580-pci-d3cold-set.patch` — FOLD PCIe auto-contenu : absorbe 0512 (skip-L23) + 0513 (suspend-OPP) + backport Pocknix 1044 (flow D3cold qcom : guards host_init, ELBI PME_TURNOFF op). Applique strictement sur v7.2 ; les helpers d'éligibilité sont déjà upstream
 - le quiesce MCU gamepad existe déjà dans notre série : `1005-input-rsinput-quiesce-the-mcu-across-system-sleep.patch`
 - `patches/0590-thermal-qcom-tsens-skip-sm8550-uplow-wake-irq.patch`
 
