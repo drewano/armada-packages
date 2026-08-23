@@ -94,6 +94,29 @@ index 0f4ad24..6aad4d9 100644
  static int qmp_ufs_power_on(struct phy *phy)
  {
  	struct qmp_ufs *qmp = phy_get_drvdata(phy);
+--- /dev/null
++++ b/include/linux/phy/phy-qcom-qmp-ufs.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __PHY_QCOM_QMP_UFS_H__
++#define __PHY_QCOM_QMP_UFS_H__
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++struct phy;
++
++#if IS_ENABLED(CONFIG_PHY_QCOM_QMP_UFS)
++int qcom_qmp_ufs_ctrl_rx_linecfg(struct phy *phy, bool enable);
++#else
++static inline int qcom_qmp_ufs_ctrl_rx_linecfg(struct phy *phy, bool enable)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++#endif
 diff --git a/drivers/ufs/host/ufs-qcom.c b/drivers/ufs/host/ufs-qcom.c
 index 291c434..9166fa7 100644
 --- a/drivers/ufs/host/ufs-qcom.c
