@@ -96,6 +96,29 @@ v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 0522-usb-dwc3-qcom-skip-phy-management-by-usb-core.patch
 0530-hwmon-pwm-fan-quiesce-tach-irqs-and-rpm-timer-across-suspend.patch
 
+# ============== Pocknix/ROCKNIX deep-suspend stack port (armada#274) ==============
+# CAUSE RACINE du faux deep (~480 mA mesurés sur Odin 2) : le driver mainline
+# qcom-rpmh ne vote qu'en ACTIVE_ONLY_STATE → chaque rail alimenté reste à
+# pleine puissance pendant le suspend → l'AOP prend la rétention superficielle
+# (arch_timer encore actif à 43/s pendant le "deep"). ROCKNIX PR #2954 a
+# mesuré ~50 mA / 0.6 %/h sur Odin 2 avec ce stack ; source :
+# shuuri-labs/pocknix-os kernel/sm8550/patches/20-sm8550.
+0560-regulator-qcom-rpmh-add-suspend-state-support.patch
+0561-regulator-core-apply-mem-state-for-s2idle.patch
+0563-input-rsinput-quiesce-mcu-across-system-sleep.patch
+0564-tty-serial-qcom-geni-mask-non-console-irq-on-suspend.patch
+0570-scsi-ufs-drain-relink-completions-out-of-band-pm.patch
+0571-scsi-ufs-qcom-propagate-hibern8-exit-failure-clk-scale.patch
+0572-scsi-ufs-qcom-auto-hibern8-clk-gating-collision.patch
+0573-scsi-ufs-qcom-keep-mphy-powered-on-hibern8-park.patch
+0574-ufs-qcom-disable-rx-linecfg-after-link-startup.patch
+0580-PCI-host-common-add-d3cold-eligibility-helper.patch
+0581-PCI-qcom-add-get_ltssm-helper.patch
+0582-PCI-qcom-power-down-phy-via-PARF_PHY_CTRL.patch
+0583-PCI-dwc-use-d3cold-eligibility-helper-in-suspend-path.patch
+0584-PCI-qcom-add-d3cold-support.patch
+0590-thermal-qcom-tsens-skip-sm8550-uplow-wake-irq.patch
+
 # ============== SM8550 DTSI prerequisites ==============
 0001-pcie-update-sm8550-dtsi.patch
 0520-arm64-dts-qcom-sm8550-add-a-pcie-suspend-opp.patch

@@ -577,3 +577,23 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: local (upstreamable)
   notes: pwm_fan_suspend() only powered the PWM off — the tachometer IRQs and the self-rearming 1 Hz RPM timer kept running across s2idle, waking the last online CPU every second (invisible in /proc/interrupts) and blocking CPU cluster collapse / AOSD on qcom handhelds. Measured 7.8k tach IRQs on AYN Thor and 10.3k on Retroid Pocket 6 during multi-hour s2idle windows. Deletes the timer and disables the tach IRQs at suspend (only when actually requested, tach->irq > 0, mirroring probe; timer_setup is unconditional so timer_delete_sync is always safe), re-arms on resume with pulses reset for a clean first RPM sample.
+
+## Port du stack deep-suspend Pocknix/ROCKNIX (branche sm8550-lpmsuspend-exp, armada#274)
+
+Cause racine établie par mesure coulomb (Odin 2, août 2026) : SYSTEM_SUSPEND
+reste à ~480 mA car qcom-rpmh-regulator ne vote qu'en ACTIVE_ONLY_STATE.
+Port des patches de jaewun (source : shuuri-labs/pocknix-os, validés à
+~50 mA / 0.6 %/h sur Odin 2) :
+
+- `patches/0560-regulator-qcom-rpmh-add-suspend-state-support.patch` — votes SLEEP/WAKE TCS pour qcom-rpmh (miroir active→sleep, ops resume)
+- `patches/0561-regulator-core-apply-mem-state-for-s2idle.patch` — le core applique l'état mem aussi en s2idle
+- DT : `dts/qcs8550-ayn-common.dtsi.patch` étendu — vreg_bob2 off-in-suspend, vreg_l15b_1p8 on-in-suspend+LPM
+- `patches/0563-input-rsinput-quiesce-mcu-across-system-sleep.patch` — quiesce MCU gamepad (GPIOs) avant l'arrêt UART (62 irq/s mesurés)
+- `patches/0564-tty-serial-qcom-geni-mask-non-console-irq-on-suspend.patch` — masque IRQ geni non-console au suspend
+- UFS : `patches/0570…0574` (drain relink OOB, hibern8-exit clk, auto-hibern8 collision, mphy park, rx-linecfg)
+- PCIe d3cold : `patches/0580…0584` (helper eligibility, get_ltssm, PHY PARF down, dwc d3cold, qcom d3cold)
+- `patches/0590-thermal-qcom-tsens-skip-sm8550-uplow-wake-irq.patch`
+
+Exclus (doublons de nos patches) : leur 1045 ≈ notre 0512, leurs 1048/1049 ≈
+nos 0513/0520. Validation attendue : coulomb deep < 200 mA (réf. 475),
+cible ROCKNIX ~50 mA.
