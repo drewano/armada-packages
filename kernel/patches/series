@@ -104,13 +104,15 @@ v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 0561-regulator-core-apply-mem-state-for-s2idle.patch
 0564-tty-serial-qcom-geni-mask-non-console-irq-on-suspend.patch
 0570-scsi-ufs-qcom-deep-suspend-set.patch
-# (le set PCIe d3cold Pocknix 1040-1045 est déjà upstream dans le kernel 7.2
-#  - pas de port nécessaire ; notre 0512/0513 étaient donc aussi redondants
-#  et ont été absorbés)
+# (le set PCIe d3cold Pocknix 1040-1044 est bien upstream dans le kernel 7.2
+#  — vérifié : PARF_LTSSM/get_ltssm/d3cold_possible présents. En revanche le
+#  suspend-opp N'EST PAS upstream (contrairement au claim précédent) : 0513
+#  restauré 23/08 après audit — protection floor DDR/LLCC anti-hard-reset —  sans lui le 0520-dts ci-dessous pointe dans le vide)
 0590-thermal-qcom-tsens-skip-sm8550-uplow-wake-irq.patch
 
 # ============== SM8550 DTSI prerequisites ==============
 0001-pcie-update-sm8550-dtsi.patch
+0513-PCI-qcom-honour-an-opp-suspend-opp-as-the-non-s2ram-memory-floor.patch
 0520-arm64-dts-qcom-sm8550-add-a-pcie-suspend-opp.patch
 0120-20250728_konradybcio_gpu_cc_power_requirements_reality_check.patch
 0121-pmdomain-qcom-rpmhpd-presync-floor-gmu-rails.patch
