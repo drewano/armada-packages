@@ -105,7 +105,9 @@ v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 0561-regulator-core-apply-mem-state-for-s2idle.patch
 0564-tty-serial-qcom-geni-mask-non-console-irq-on-suspend.patch
 0570-scsi-ufs-qcom-deep-suspend-set.patch
-0580-pci-d3cold-set.patch
+# (le set PCIe d3cold Pocknix 1040-1045 est déjà upstream dans le kernel 7.2
+#  - pas de port nécessaire ; notre 0512/0513 étaient donc aussi redondants
+#  et ont été absorbés)
 0590-thermal-qcom-tsens-skip-sm8550-uplow-wake-irq.patch
 
 # ============== SM8550 DTSI prerequisites ==============
