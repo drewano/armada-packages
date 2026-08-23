@@ -101,6 +101,7 @@ index 0000000..c3c6cbc
 + */
 +#include <linux/interrupt.h>
 +#include <linux/mod_devicetable.h>
++#include <linux/of_irq.h>
 +#include <linux/platform_device.h>
 +#include <linux/pm_wakeup.h>
 +#include <linux/soc/qcom/smem_state.h>
