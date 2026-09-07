@@ -120,7 +120,7 @@ diff --git a/drivers/cpuidle/governors/qcom-simple-lpm.c b/drivers/cpuidle/gover
 new file mode 100644
 --- /dev/null
 +++ b/drivers/cpuidle/governors/qcom-simple-lpm.c
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,297 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
@@ -129,6 +129,7 @@ new file mode 100644
 +#include <linux/cpu.h>
 +#include <linux/cpuidle.h>
 +#include <linux/ktime.h>
++#include <linux/hrtimer.h>
 +#include <linux/module.h>
 +#include <linux/pm_qos.h>
 +#include <linux/smp.h>
@@ -421,7 +422,7 @@ diff --git a/drivers/cpuidle/governors/qcom-simple-cluster-lpm.c b/drivers/cpuid
 new file mode 100644
 --- /dev/null
 +++ b/drivers/cpuidle/governors/qcom-simple-cluster-lpm.c
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,168 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
@@ -429,6 +430,7 @@ new file mode 100644
 +
 +#include <linux/kernel.h>
 +#include <linux/ktime.h>
++#include <linux/hrtimer.h>
 +#include <linux/module.h>
 +#include <linux/platform_device.h>
 +#include <linux/pm_domain.h>
@@ -1198,7 +1200,7 @@ diff --git a/drivers/cpuidle/governors/qcom-lpm.c b/drivers/cpuidle/governors/qc
 new file mode 100644
 --- /dev/null
 +++ b/drivers/cpuidle/governors/qcom-lpm.c
-@@ -0,0 +1,879 @@
+@@ -0,0 +1,878 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (C) 2006-2007 Adam Belay <abelay@novell.com>
@@ -1210,6 +1212,7 @@ new file mode 100644
 +#include <linux/cpu.h>
 +#include <linux/cpuidle.h>
 +#include <linux/cpu_pm.h>
++#include <linux/hrtimer.h>
 +#include <linux/ktime.h>
 +#include <linux/module.h>
 +#include <linux/pm_domain.h>
@@ -1309,7 +1312,6 @@ new file mode 100644
 +	struct lpm_cpu *cpu_gov = this_cpu_ptr(&lpm_cpu_data);
 +	struct hrtimer *cpu_histtimer = &cpu_gov->histtimer;
 +
-+	cpu_histtimer->function = histtimer_fn;
 +	hrtimer_start(cpu_histtimer, hist_ktime, HRTIMER_MODE_REL_PINNED);
 +}
 +
@@ -1360,7 +1362,6 @@ new file mode 100644
 +	struct lpm_cpu *cpu_gov = this_cpu_ptr(&lpm_cpu_data);
 +	struct hrtimer *cpu_biastimer = &cpu_gov->biastimer;
 +
-+	cpu_biastimer->function = biastimer_fn;
 +	hrtimer_start(cpu_biastimer, bias_ktime, HRTIMER_MODE_REL_PINNED);
 +}
 +
@@ -1947,8 +1948,8 @@ new file mode 100644
 +	int ret;
 +
 +	spin_lock_init(&cpu_gov->lock);
-+	hrtimer_init(cpu_histtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-+	hrtimer_init(cpu_biastimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	hrtimer_setup(cpu_histtimer, histtimer_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	hrtimer_setup(cpu_biastimer, biastimer_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 +	if (!traces_registered) {
 +		ret = register_trace_ipi_raise(ipi_raise, NULL);
 +		if (ret)
@@ -2092,6 +2093,7 @@ new file mode 100644
 +#include <linux/cpu.h>
 +#include <linux/cpuidle.h>
 +#include <linux/cpu_pm.h>
++#include <linux/hrtimer.h>
 +#include <linux/kernel.h>
 +#include <linux/ktime.h>
 +#include <linux/module.h>
@@ -2146,7 +2148,6 @@ new file mode 100644
 +	uint64_t time_ns = time_us * NSEC_PER_USEC;
 +	ktime_t clust_ktime = ns_to_ktime(time_ns);
 +
-+	timer->function = clusttimer_fn;
 +	hrtimer_start(timer, clust_ktime, HRTIMER_MODE_REL_PINNED);
 +}
 +
@@ -2530,7 +2531,7 @@ new file mode 100644
 +	cluster_gov->dev = &pdev->dev;
 +	cluster_gov->pred_wakeup = KTIME_MAX;
 +	pm_runtime_enable(&pdev->dev);
-+	hrtimer_init(&cluster_gov->histtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	hrtimer_setup(&cluster_gov->histtimer, clusttimer_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 +	cluster_gov->genpd = pd_to_genpd(cluster_gov->dev->pm_domain);
 +	cluster_gov->genpd_nb.notifier_call = cluster_power_cb;
 +	cluster_gov->genpd->flags |= GENPD_FLAG_MIN_RESIDENCY;
