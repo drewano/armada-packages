@@ -99,7 +99,6 @@ v9_20260729_qualcomm_crypto_qce_runtime_pm_interconnect.patch
 # ============== Pocknix/ROCKNIX deep-suspend stack port (armada#274) ==============
 0560-regulator-qcom-rpmh-add-suspend-state-support.patch
 0561-regulator-core-apply-mem-state-for-s2idle.patch
-0564-tty-serial-qcom-geni-mask-non-console-irq-on-suspend.patch
 0570-scsi-ufs-qcom-deep-suspend-set.patch
 0590-thermal-qcom-tsens-skip-sm8550-uplow-wake-irq.patch
 
