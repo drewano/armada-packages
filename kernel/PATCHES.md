@@ -271,6 +271,42 @@ no equivalent submission was found, or a permanent URL to the upstream submissio
   source: armada
   upstream: not submitted
   notes: Companion DT for 0513. `opp-hz` is synthetic and `opp-level` is omitted so the OPP can never be selected for a trained link by either match in `qcom_pcie_icc_opp_update()`. pcie1 is disabled in the SM8550 board DTS files that use this table and gets no suspend OPP.
+- `patches/0521-mmc-sdhci-msm-mask-controller-irqs-while-runtime-suspended.patch`
+  source: armada
+  upstream: not submitted
+  notes: Masks sdhci-msm controller IRQs while runtime suspended to stop the mmc0 IRQ storm during s2idle on SM8550.
+- `patches/0522-usb-dwc3-qcom-skip-phy-management-by-usb-core.patch`
+  source: lore.kernel.org/all/20260723-dwc3-skip-init-quirk-v1-1-97682bb44ebd@oss.qualcomm.com
+  upstream: in review
+  notes: Stops double phy_init where HCD core holds a reference, preventing dwc3 PHY vote from blocking CX power collapse in s2idle.
+- `patches/0530-hwmon-pwm-fan-quiesce-tach-irqs-and-rpm-timer-across-suspend.patch`
+  source: armada
+  upstream: not submitted
+  notes: Quiesces pwm-fan tachometer interrupts and the 1 Hz polling timer across suspend to eliminate background wakeups.
+- `patches/0560-regulator-qcom-rpmh-add-suspend-state-support.patch`
+  source: ROCKNIX PR 2954 / 3126 (Luke Johnson)
+  upstream: in review
+  notes: Implements regulator-state-mem in qcom-rpmh regulator driver, allowing regulators (like bob2 gamepad rail) to be powered down during system suspend.
+- `patches/0561-regulator-core-apply-mem-state-for-s2idle.patch`
+  source: ROCKNIX PR 2954 / 3126 (Luke Johnson)
+  upstream: in review
+  notes: Applies regulator-state-mem constraints to s2idle (PM_SUSPEND_TO_IDLE) on platforms without separate suspend-to-idle DT bindings.
+- `patches/0564-tty-serial-qcom-geni-mask-non-console-irq-on-suspend.patch`
+  source: ROCKNIX PR 3126 (jaewun)
+  upstream: in review
+  notes: Masks non-console GENI UART interrupts (gamepad MCU) across system suspend to prevent spurious interrupt storms.
+- `patches/0570-scsi-ufs-qcom-deep-suspend-set.patch`
+  source: ROCKNIX PR 3126 (jaewun, gh123man)
+  upstream: in review
+  notes: Folded UFS deep suspend set: disables HW auto-hibern8 with clk-gating, recovers hibern8-enter failures inline, keeps M-PHY powered across hibern8 parking, and holds clk-gating across system PM.
+- `patches/0590-thermal-qcom-tsens-skip-sm8550-uplow-wake-irq.patch`
+  source: ROCKNIX PR 3126 (Edouard Durand)
+  upstream: in review
+  notes: Skips arming SM8550 uplow threshold IRQs as wakeup sources during suspend, preventing immediate false wakeups while keeping critical threshold alarms armed.
+- `patches/0595-cpuidle-governors-qcom-lpm.patch`
+  source: Qualcomm BSP / OnePlus SM8550 (adapted for mainline Linux 7.2)
+  upstream: not submitted
+  notes: Ports Qualcomm Low Power Mode (LPM) governors (qcom-simple-lpm and predictive qcom-lpm with cluster governors). Eliminates CPU0 WFI lockup and coordinates multi-cluster power collapse under handheld gaming workloads.
 - `patches/0120-20250728_konradybcio_gpu_cc_power_requirements_reality_check.patch`
   source: https://github.com/ROCKNIX/distribution/blob/ef264a238d5e2ba960145e3fda663dc27de49a80/projects/ROCKNIX/devices/SM8550/patches/linux/0120-20250728_konradybcio_gpu_cc_power_requirements_reality_check.patch
   upstream: https://lore.kernel.org/r/20250728-topic-gpucc_power_plumbing-v1-22-09c2480fe3e6@oss.qualcomm.com
