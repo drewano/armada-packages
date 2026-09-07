@@ -2083,7 +2083,7 @@ diff --git a/drivers/cpuidle/governors/qcom-cluster-lpm.c b/drivers/cpuidle/gove
 new file mode 100644
 --- /dev/null
 +++ b/drivers/cpuidle/governors/qcom-cluster-lpm.c
-@@ -0,0 +1,520 @@
+@@ -0,0 +1,522 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2021, The Linux Foundation. All rights reserved.
@@ -2342,8 +2342,10 @@ new file mode 100644
 +
 +	cluster_gov->entry_time = cluster_gov->now;
 +	cluster_gov->entry_idx = idx;
-+	trace_cluster_pred_select(genpd->state_idx, genpd->next_wakeup,
-+				  0, cluster_gov->predicted, cluster_gov->next_wakeup);
++	trace_cluster_pred_select(genpd->state_idx,
++				  (u32)ktime_to_us(cluster_gov->next_wakeup),
++				  0, cluster_gov->predicted,
++				  (u32)ktime_to_us(cluster_gov->pred_wakeup));
 +	if (idx >= genpd->state_count - 1) {
 +		clear_cpu_predict_history();
 +		clear_cluster_history(cluster_gov);
