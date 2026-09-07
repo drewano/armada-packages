@@ -102,7 +102,7 @@ new file mode 100644
 +
 +DECLARE_PER_CPU(struct simple_lpm_cpu, lpm_cpu_data);
 +
-+extern struct list_head cluster_dev_list;
++extern struct list_head simple_cluster_dev_list;
 +extern u32 cur_div;
 +extern u32 cluster_cur_div;
 +
@@ -445,21 +445,21 @@ new file mode 100644
 +
 +#include "qcom-simple-lpm.h"
 +
-+LIST_HEAD(cluster_dev_list);
++LIST_HEAD(simple_cluster_dev_list);
 +u32 cluster_cur_div = 500;
 +
 +static struct simple_lpm_cluster *to_cluster(struct generic_pm_domain *genpd)
 +{
 +	struct simple_lpm_cluster *cluster_simple_gov;
 +
-+	list_for_each_entry(cluster_simple_gov, &cluster_dev_list, list)
++	list_for_each_entry(cluster_simple_gov, &simple_cluster_dev_list, list)
 +		if (cluster_simple_gov->genpd == genpd)
 +			return cluster_simple_gov;
 +
 +	return NULL;
 +}
 +
-+void update_cluster_select(struct simple_lpm_cpu *cpu_gov)
++void update_simple_cluster_select(struct simple_lpm_cpu *cpu_gov)
 +{
 +}
 +
@@ -528,7 +528,7 @@ new file mode 100644
 +		return ret;
 +	}
 +
-+	list_add_tail(&cluster_simple_gov->list, &cluster_dev_list);
++	list_add_tail(&cluster_simple_gov->list, &simple_cluster_dev_list);
 +	cluster_simple_gov->initialized = true;
 +
 +	for (i = 0; i < cluster_simple_gov->genpd->state_count; i++) {
@@ -575,20 +575,20 @@ new file mode 100644
 +	platform_driver_register(&qcom_cluster_simple_lpm_driver);
 +}
 +
-+struct simple_cluster_governor gov_ops = {
-+	.select = update_cluster_select,
++static struct simple_cluster_governor simple_gov_ops = {
++	.select = update_simple_cluster_select,
 +	.enable = cluster_simple_gov_enable,
 +	.disable = cluster_simple_gov_disable,
 +};
 +
 +void qcom_cluster_lpm_simple_governor_deinit(void)
 +{
-+	unregister_cluster_simple_governor_ops(&gov_ops);
++	unregister_cluster_simple_governor_ops(&simple_gov_ops);
 +}
 +
 +int qcom_cluster_lpm_simple_governor_init(void)
 +{
-+	register_cluster_simple_governor_ops(&gov_ops);
++	register_cluster_simple_governor_ops(&simple_gov_ops);
 +
 +	return 0;
 +}
@@ -798,7 +798,7 @@ new file mode 100644
 +		return count;
 +	}
 +
-+	list_for_each_entry(cluster_simple_gov, &cluster_dev_list, list) {
++	list_for_each_entry(cluster_simple_gov, &simple_cluster_dev_list, list) {
 +		for (i = 0; i < cluster_simple_gov->genpd->state_count; i++) {
 +			struct generic_pm_domain *genpd = cluster_simple_gov->genpd;
 +			struct genpd_power_state *state = &genpd->states[i];
@@ -2121,7 +2121,7 @@ new file mode 100644
 +#include "trace-cluster-lpm.h"
 +#include "qcom-lpm.h"
 +
-+LIST_HEAD(cluster_dev_list);
++static LIST_HEAD(cluster_dev_list);
 +
 +static struct lpm_cluster *to_cluster(struct generic_pm_domain *genpd)
 +{
@@ -2599,7 +2599,7 @@ new file mode 100644
 +	platform_driver_register(&qcom_cluster_lpm_driver);
 +}
 +
-+struct cluster_governor gov_ops = {
++static struct cluster_governor gov_ops = {
 +	.select = update_cluster_select,
 +	.enable = cluster_gov_enable,
 +	.disable = cluster_gov_disable,
