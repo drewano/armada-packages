@@ -120,13 +120,14 @@ diff --git a/drivers/cpuidle/governors/qcom-simple-lpm.c b/drivers/cpuidle/gover
 new file mode 100644
 --- /dev/null
 +++ b/drivers/cpuidle/governors/qcom-simple-lpm.c
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,298 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
 + */
 +
 +#include <linux/cpu.h>
++#include <linux/device/bus.h>
 +#include <linux/cpuidle.h>
 +#include <linux/ktime.h>
 +#include <linux/hrtimer.h>
@@ -595,7 +596,7 @@ diff --git a/drivers/cpuidle/governors/qcom-simple-lpm-sysfs.c b/drivers/cpuidle
 new file mode 100644
 --- /dev/null
 +++ b/drivers/cpuidle/governors/qcom-simple-lpm-sysfs.c
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,267 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
@@ -749,7 +750,7 @@ new file mode 100644
 +	bool val;
 +	int ret;
 +
-+	ret = kkstrtobool(buf, &val);
++	ret = kstrtobool(buf, &val);
 +	if (ret) {
 +		pr_err("Invalid argument passed\n");
 +		return count;
@@ -846,13 +847,22 @@ new file mode 100644
 +
 +int create_simple_gov_global_sysfs_nodes(void)
 +{
-+	struct kobject *cpuidle_kobj = &cpu_subsys.dev_root->kobj;
++	struct device *dev_root = bus_get_dev_root(&cpu_subsys);
++	int ret;
 +
-+	qcom_lpm_simple_kobj = kobject_create_and_add("qcom_simple_lpm", cpuidle_kobj);
++	if (!dev_root)
++		return -ENODEV;
++
++	qcom_lpm_simple_kobj = kobject_create_and_add("qcom_simple_lpm", &dev_root->kobj);
++	put_device(dev_root);
 +	if (!qcom_lpm_simple_kobj)
 +		return -ENOMEM;
 +
-+	return sysfs_create_group(qcom_lpm_simple_kobj, &lpm_gov_attr_group);
++	ret = sysfs_create_group(qcom_lpm_simple_kobj, &lpm_gov_attr_group);
++	if (ret)
++		kobject_put(qcom_lpm_simple_kobj);
++
++	return ret;
 +}
 diff --git a/drivers/cpuidle/governors/qcom-lpm.h b/drivers/cpuidle/governors/qcom-lpm.h
 new file mode 100644
@@ -2610,7 +2620,7 @@ diff --git a/drivers/cpuidle/governors/qcom-lpm-sysfs.c b/drivers/cpuidle/govern
 new file mode 100644
 --- /dev/null
 +++ b/drivers/cpuidle/governors/qcom-lpm-sysfs.c
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,225 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Copyright (c) 2021, The Linux Foundation. All rights reserved.
@@ -2618,6 +2628,7 @@ new file mode 100644
 + */
 +
 +#include <linux/cpu.h>
++#include <linux/device/bus.h>
 +#include <linux/cpuidle.h>
 +#include <linux/module.h>
 +#include <linux/moduleparam.h>
@@ -2761,7 +2772,7 @@ new file mode 100644
 +	bool val;
 +	int ret;
 +
-+	ret = kkstrtobool(buf, &val);
++	ret = kstrtobool(buf, &val);
 +	if (ret) {
 +		pr_err("Invalid argument passed\n");
 +		return ret;
@@ -2786,7 +2797,7 @@ new file mode 100644
 +	bool val;
 +	int ret;
 +
-+	ret = kkstrtobool(buf, &val);
++	ret = kstrtobool(buf, &val);
 +	if (ret) {
 +		pr_err("Invalid argument passed\n");
 +		return ret;
@@ -2818,11 +2829,20 @@ new file mode 100644
 +
 +int create_global_sysfs_nodes(void)
 +{
-+	struct kobject *cpuidle_kobj = &cpu_subsys.dev_root->kobj;
++	struct device *dev_root = bus_get_dev_root(&cpu_subsys);
++	int ret;
 +
-+	qcom_lpm_kobj = kobject_create_and_add(KBUILD_MODNAME, cpuidle_kobj);
++	if (!dev_root)
++		return -ENODEV;
++
++	qcom_lpm_kobj = kobject_create_and_add("qcom_lpm", &dev_root->kobj);
++	put_device(dev_root);
 +	if (!qcom_lpm_kobj)
 +		return -ENOMEM;
 +
-+	return sysfs_create_group(qcom_lpm_kobj, &lpm_gov_attr_group);
++	ret = sysfs_create_group(qcom_lpm_kobj, &lpm_gov_attr_group);
++	if (ret)
++		kobject_put(qcom_lpm_kobj);
++
++	return ret;
 +}
